@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # ========== CONFIG ==========
-BOT_TOKEN = "8039759985:AAEict5BjTt3Z9z-nkXgdApdaLzHIUBazhA"
+BOT_TOKEN = "YOUR BOTS TOKEN"
 user_locations = {}  # Stores user's location by chat ID
 # ============================
 
