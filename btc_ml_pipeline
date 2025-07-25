@@ -1,0 +1,241 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+
+# -----------------------------
+# 1. Data Acquisition
+# -----------------------------
+def fetch_btc_data():
+    df = yf.download("BTC-USD", start="2017-01-01", interval="1d")
+    df.reset_index(inplace=True)
+    df['Return_1D'] = df['Close'].pct_change()
+    df['Log_Return_1D'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['EMA_5'] = df['Close'].ewm(span=5).mean()
+    df['EMA_20'] = df['Close'].ewm(span=20).mean()
+    df['RSI_14'] = compute_rsi(df['Close'], 14)
+    df = df.dropna()
+    return df
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# -----------------------------
+# 2. Prepare Sequences
+# -----------------------------
+def create_sequences(data_X, log_returns, window_size=60, forecast_horizon=30):
+    X, y, P_start = [], [], []
+    for i in range(len(data_X) - window_size - forecast_horizon):
+        X.append(data_X[i:i+window_size])
+        y.append(log_returns[i+window_size:i+window_size+forecast_horizon])
+        P_start.append(data_X[i+window_size-1, 0])
+    return np.array(X), np.array(y), np.array(P_start)
+
+# -----------------------------
+# 3. Transformer Model with Positional Encoding
+# -----------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+class BTCLogReturnTransformer(nn.Module):
+    def __init__(self, input_dim, model_dim=100, nhead=4, num_layers=3, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, model_dim)
+        self.pos_encoder = PositionalEncoding(model_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=nhead, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_proj = nn.Linear(model_dim, 30)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        x = x[:, -1, :]
+        return self.output_proj(x)
+
+# -----------------------------
+# 4. Training & Evaluation
+# -----------------------------
+def train_model(model, train_loader, val_loader, num_epochs=20, lr=1e-3, patience=3):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    best_val_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            output = model(batch_X)
+            loss = criterion(output, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for val_X, val_y in val_loader:
+                val_X, val_y = val_X.to(device), val_y.to(device)
+                output = model(val_X)
+                loss = criterion(output, val_y)
+                val_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"⏹️ Early stopping triggered at epoch {epoch+1}.")
+                break
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    return model
+
+def evaluate_model(model, X_test, y_test_log_returns, start_prices, scaler_y):
+    model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X_test = torch.tensor(X_test, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        pred_log_returns = model(X_test).cpu().numpy()
+
+    y_test_prices = []
+    pred_prices = []
+
+    for i in range(len(pred_log_returns)):
+        P0 = scaler_y.inverse_transform([[start_prices[i]]])[0][0]
+        true_log = y_test_log_returns[i]
+        pred_log = pred_log_returns[i]
+
+        true_price_path = P0 * np.exp(np.cumsum(true_log))
+        pred_price_path = P0 * np.exp(np.cumsum(pred_log))
+
+        y_test_prices.append(true_price_path)
+        pred_prices.append(pred_price_path)
+
+    y_test_prices = np.array(y_test_prices)
+    pred_prices = np.array(pred_prices)
+
+    rmse = np.sqrt(mean_squared_error(y_test_prices, pred_prices))
+    r2 = r2_score(y_test_prices, pred_prices)
+    print(f"\n📊 RMSE: {rmse:.2f} | R² Score: {r2:.4f}")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(30), y_test_prices[0], label="Actual BTC Price")
+    plt.plot(range(30), pred_prices[0], label="Predicted BTC Price")
+    plt.title("30-Day BTC Price Forecast (First Sample)")
+    plt.xlabel("Day")
+    plt.ylabel("Price (USD)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def forecast_next_30_days(model, df, data_scaled, scaler_y, window_size=60):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    model.to(device)
+
+    X_input = data_scaled[-window_size:]
+    X_input_tensor = torch.tensor(X_input, dtype=torch.float32).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        pred_log_returns = model(X_input_tensor).cpu().numpy().flatten()
+
+    last_close_scaled = data_scaled[-1, 0]
+    last_close = scaler_y.inverse_transform([[last_close_scaled]])[0][0]
+
+    pred_prices = last_close * np.exp(np.cumsum(pred_log_returns))
+    last_date = df['Date'].iloc[-1]
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30)
+
+    df_plot = df[df['Date'] >= "2023-01-01"].copy()
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(df_plot['Date'], df_plot['Close'], label="Actual BTC Price")
+    plt.plot(future_dates, pred_prices, label="Predicted BTC Price (Next 30 Days)", linestyle="--")
+    plt.title("BTC Price: Jan 2023 to Today + 30-Day Forecast")
+    plt.xlabel("Date")
+    plt.ylabel("Price (USD)")
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("btc_price_forecast_2023_to_today_plus_30days.png")
+    print("\n📁 Forecast chart saved to: btc_price_forecast_2023_to_today_plus_30days.png")
+
+# -----------------------------
+# 5. Main
+# -----------------------------
+if __name__ == "__main__":
+    df = fetch_btc_data()
+    feature_cols = ['Close', 'Return_1D', 'Log_Return_1D', 'EMA_5', 'EMA_20', 'RSI_14']
+    data = df[feature_cols].values
+
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    data_scaled = scaler_X.fit_transform(data)
+    close_scaled = scaler_y.fit_transform(data[:, [0]])
+
+    full_log_returns = np.log(data[:, 0][1:] / data[:, 0][:-1])
+    full_log_returns = np.concatenate([[0], full_log_returns])
+    data_scaled[:, 0] = close_scaled[:, 0]
+
+    X, y_log, P_start = create_sequences(data_scaled, full_log_returns, window_size=60, forecast_horizon=30)
+
+    split = int(0.8 * len(X))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y_log[:split], y_log[split:]
+    P_train, P_test = P_start[:split], P_start[split:]
+
+    train_dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                                   torch.tensor(y_train, dtype=torch.float32))
+    test_dataset = torch.utils.data.TensorDataset(torch.tensor(X_test, dtype=torch.float32),
+                                                  torch.tensor(y_test, dtype=torch.float32))
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32)
+
+    print("\n🚀 Training Transformer model to predict log returns...")
+    model = BTCLogReturnTransformer(input_dim=X.shape[2])
+    model = train_model(model, train_loader, val_loader)
+
+    print("\n📈 Evaluating on test set...")
+    evaluate_model(model, X_test, y_test, P_test, scaler_y)
+
+    forecast_next_30_days(model, df, data_scaled, scaler_y)
+
+    print("\n✅ Done.")
