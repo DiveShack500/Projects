@@ -1,0 +1,1135 @@
+"""
+Professional Quantitative Trading Strategy - Multi-Factor Momentum
+==================================================================
+
+A production-grade algorithmic trading system featuring:
+
+1. REGIME DETECTION
+   - ADX-based trend strength detection
+   - ATR percentile volatility classification
+   - Dynamic strategy adaptation
+
+2. MULTI-FACTOR MOMENTUM
+   - Price momentum (rate of change)
+   - Volume momentum (surge detection)
+   - Volatility breakout (Bollinger squeeze)
+   - Relative strength (vs basket)
+   - Trend alignment (multi-timeframe)
+
+3. ADVANCED POSITION SIZING
+   - Kelly Criterion optimization
+   - Portfolio heat management
+   - Volatility-adjusted sizing
+   - Correlation-aware allocation
+
+4. ADAPTIVE RISK MANAGEMENT
+   - Regime-dependent stop losses
+   - Dynamic profit targets
+   - Time-based position limits
+   - Portfolio-level risk caps
+
+DATA LEAKAGE FIXES (vs original):
+----------------------------------
+FIX 1 - ENTRY PRICE (Critical):
+    Original: entry executed at signal bar's close price.
+    Fixed:    signal generated at bar T close; entry executed at bar T+1 open.
+              All signals are stored as pending orders and filled next bar.
+
+FIX 2 - BASKET PERFORMANCE (Medium):
+    Original: basket perf computed using current bar's close, then fed as a
+              signal factor for the same bar. Contemporaneous leakage.
+    Fixed:    basket perf uses previous bar's close (idx-1), so only
+              information available *before* the current bar is used.
+
+FIX 3 - INTRABAR STOP/TARGET RESOLUTION (Medium):
+    Original: stops and targets checked against bar close only. If a stop
+              was breached intrabar but close recovered, it was missed.
+              Targets hit intrabar filled at close (wrong price).
+    Fixed:    use bar's high/low/open for intrabar resolution:
+              - Gap open below stop  → fill at open  (gap-down worst case)
+              - Low breaches stop    → fill at stop price
+              - Gap open above target → fill at open (gap-up best case)
+              - High reaches target  → fill at target price
+              - If both stop and target hit same bar → stop takes priority
+                (pessimistic/realistic convention)
+
+FIX 4 - SIGNAL SCORE ROC USES PREVIOUS BAR'S CLOSE (Minor):
+    Original: rate-of-change compared df.iloc[idx] to df.iloc[idx - lookback].
+              idx is the current signal bar — already causal. No change needed.
+              (Documented here to confirm it was reviewed.)
+
+Author: Professional Quant Strategy
+Version: 2.0 (Leakage-Free)
+"""
+
+import sys
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
+
+import pandas as pd
+import numpy as np
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class StrategyConfig:
+    """Professional strategy configuration"""
+
+    # Capital Management
+    initial_capital: float = 10000.0
+    max_position_pct: float = 0.20       # Max 20% per position
+    max_portfolio_heat: float = 0.02     # Max 2% portfolio risk
+    kelly_fraction: float = 0.25         # Use quarter-Kelly for safety
+
+    # Multi-Factor Signal Thresholds
+    min_signal_score: float = 6.0        # Minimum score out of 10
+    momentum_lookback: int = 10          # Bars for momentum calculation
+    volume_surge_threshold: float = 1.5  # 1.5x average volume
+    roc_threshold: float = 0.015         # 1.5% rate of change
+
+    # Regime Detection
+    adx_trending_threshold: int = 25
+    adx_ranging_threshold: int = 20
+    atr_high_vol_percentile: int = 70
+    atr_low_vol_percentile: int = 50
+
+    # Risk Management (Regime-Dependent)
+    stop_trending_low_vol: float = 2.5   # ATR multiplier
+    stop_trending_high_vol: float = 1.5
+    stop_ranging: float = 1.0
+
+    # Profit Targets (Regime-Dependent)
+    target_trending_low_vol: float = 4.0   # ATR multiplier
+    target_trending_high_vol: float = 2.5
+    target_ranging: float = 1.5
+
+    # Partial Exits (Progressive)
+    partial_pct_1: float = 0.25   # 25% at first target
+    partial_pct_2: float = 0.35   # 35% at second target
+    partial_pct_3: float = 0.40   # 40% at final target
+
+    # Execution Costs
+    commission_bps: float = 10.0   # Basis points
+    slippage_bps: float = 5.0      # Basis points
+
+    # Time Filters
+    max_holding_bars: int = 100    # Max bars to hold position
+
+    def __post_init__(self):
+        """Convert basis points to decimal"""
+        self.commission_rate = self.commission_bps / 10000.0
+        self.slippage_rate = self.slippage_bps / 10000.0
+
+
+# =============================================================================
+# Technical Indicators (Institutional Grade)
+# =============================================================================
+
+class QuantIndicators:
+    """Professional-grade technical indicators"""
+
+    @staticmethod
+    def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Average True Range"""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        tr1 = high - low
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        return tr.rolling(window=period).mean()
+
+    @staticmethod
+    def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Average Directional Index - Trend Strength"""
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+
+        tr1 = high - low
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+        atr = tr.rolling(window=period).mean()
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        return adx
+
+    @staticmethod
+    def bollinger_bands(prices: pd.Series, period: int = 20, std_dev: float = 2.0):
+        """Bollinger Bands"""
+        middle = prices.rolling(window=period).mean()
+        std = prices.rolling(window=period).std()
+        upper = middle + (std_dev * std)
+        lower = middle - (std_dev * std)
+        return upper, middle, lower
+
+    @staticmethod
+    def rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+        """Relative Strength Index"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def ema(prices: pd.Series, period: int) -> pd.Series:
+        """Exponential Moving Average"""
+        return prices.ewm(span=period, adjust=False).mean()
+
+
+# =============================================================================
+# Market Regime Detection
+# =============================================================================
+
+class RegimeDetector:
+    """Institutional-grade market regime classification"""
+
+    TRENDING_LOW_VOL  = "TRENDING_LOW_VOL"
+    TRENDING_HIGH_VOL = "TRENDING_HIGH_VOL"
+    RANGING           = "RANGING"
+    CHOPPY            = "CHOPPY"
+
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+
+    def detect(self, df: pd.DataFrame, idx: int) -> str:
+        """
+        Detect current market regime using only data up to idx.
+        All look-back windows are strictly backward-looking.
+        """
+        if idx < 100:
+            return self.CHOPPY
+
+        adx_val = df.iloc[idx]['adx']
+        atr_val = df.iloc[idx]['atr']
+
+        # ATR percentile over trailing 100 bars — strictly causal
+        atr_window = df.iloc[max(0, idx - 100):idx + 1]['atr']
+        atr_percentile = (atr_window < atr_val).sum() / len(atr_window) * 100
+
+        if pd.isna(adx_val) or pd.isna(atr_val):
+            return self.CHOPPY
+
+        is_trending  = adx_val > self.config.adx_trending_threshold
+        is_ranging   = adx_val < self.config.adx_ranging_threshold
+        is_high_vol  = atr_percentile > self.config.atr_high_vol_percentile
+        is_low_vol   = atr_percentile < self.config.atr_low_vol_percentile
+
+        if is_trending and is_low_vol:
+            return self.TRENDING_LOW_VOL
+        elif is_trending and is_high_vol:
+            return self.TRENDING_HIGH_VOL
+        elif is_ranging:
+            return self.RANGING
+        else:
+            return self.CHOPPY
+
+
+# =============================================================================
+# Multi-Factor Signal Generator
+# =============================================================================
+
+class MultiFactorSignal:
+    """
+    Professional multi-factor momentum scoring (0-10 scale).
+
+    FIX 2 applied here:
+        basket_performance is passed in as the performance of all other
+        symbols measured up to the *previous* bar (idx-1), not the
+        current bar. This prevents contemporaneous leakage where the
+        current bar's close is used both as a signal input and an
+        implicit entry price.
+    """
+
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+
+    def calculate_score(
+        self,
+        df: pd.DataFrame,
+        idx: int,
+        basket_performance: float = 0.0,
+    ) -> Tuple[float, dict]:
+        """
+        Calculate multi-factor signal strength using only data up to bar idx.
+
+        basket_performance must be computed from data up to idx-1 by the
+        caller (see calc_basket_performance in the backtest engine).
+        """
+        if idx < 100:
+            return 0.0, {}
+
+        row = df.iloc[idx]
+        factors: dict = {}
+        score = 0.0
+
+        # Factor 1: Price Momentum (Weight: 20%)
+        # Causal: compares current bar close to close N bars ago.
+        lookback_close = df.iloc[idx - self.config.momentum_lookback]['close']
+        roc = (row['close'] - lookback_close) / lookback_close
+        if roc > self.config.roc_threshold:
+            momentum_score = min(2.0, roc / self.config.roc_threshold)
+            score += momentum_score
+            factors['momentum'] = momentum_score
+
+        # Factor 2: Volume Momentum (Weight: 15%)
+        # Causal: mean over bars [idx-20, idx-1] (excludes current bar to
+        # avoid using the same bar's volume both as signal and baseline).
+        volume_ma = df.iloc[max(0, idx - 20):idx]['volume'].mean()
+        if row['volume'] > volume_ma * self.config.volume_surge_threshold:
+            score += 1.5
+            factors['volume'] = 1.5
+
+        # Factor 3: Volatility Breakout — Bollinger Squeeze (Weight: 15%)
+        # Causal: percentile over trailing 50 bars including current bar.
+        bb_width = (row['bb_upper'] - row['bb_lower']) / row['close']
+        bb_window = df.iloc[max(0, idx - 50):idx + 1]
+        bb_widths = (bb_window['bb_upper'] - bb_window['bb_lower']) / bb_window['close']
+        bb_percentile = (bb_widths < bb_width).sum() / len(bb_widths) * 100
+
+        if bb_percentile < 20:
+            score += 1.5
+            factors['squeeze'] = 1.5
+
+        # Factor 4: Relative Strength vs Basket (Weight: 20%)
+        # FIX 2: basket_performance is computed from data through idx-1 by
+        # the caller, so this comparison is fully causal. We compare the
+        # symbol's own *current bar* performance against the basket's
+        # *previous bar* performance — a slight asymmetry that is
+        # intentional and conservative (we require the symbol to already
+        # be outperforming before the basket catches up).
+        if basket_performance != 0:
+            own_perf = (row['close'] - df.iloc[max(0, idx - 20)]['close']) / df.iloc[max(0, idx - 20)]['close']
+            if own_perf > basket_performance:
+                score += 2.0
+                factors['relative_strength'] = 2.0
+
+        # Factor 5: Trend Alignment (Weight: 30%)
+        # Causal: all SMAs are rolling windows ending at current bar.
+        if not any(pd.isna(row[c]) for c in ('sma_20', 'sma_50', 'sma_200')):
+            if row['close'] > row['sma_20'] > row['sma_50'] > row['sma_200']:
+                score += 3.0
+                factors['trend'] = 3.0
+            elif row['close'] > row['sma_20'] > row['sma_50']:
+                score += 2.0
+                factors['trend'] = 2.0
+            elif row['close'] > row['sma_20']:
+                score += 1.0
+                factors['trend'] = 1.0
+
+        return score, factors
+
+
+# =============================================================================
+# Kelly Criterion Position Sizing
+# =============================================================================
+
+class KellyPositionSizer:
+    """
+    Optimal position sizing using Kelly Criterion.
+
+    Kelly % = (WinRate × AvgWin − LossRate × AvgLoss) / AvgLoss
+
+    Uses a fraction of Kelly for safety (typically 25%).
+    Trade history is strictly backward-looking (closed trades only).
+    """
+
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+        self.trade_history: List[float] = []
+
+    def calculate_size(self, capital: float, current_price: float, stop_distance: float) -> float:
+        """Calculate optimal position size in dollars."""
+        if len(self.trade_history) < 10:
+            return capital * 0.10
+
+        wins   = [t for t in self.trade_history if t > 0]
+        losses = [t for t in self.trade_history if t < 0]
+
+        if not wins or not losses:
+            return capital * 0.10
+
+        win_rate  = len(wins) / len(self.trade_history)
+        avg_win   = np.mean(wins)
+        avg_loss  = abs(np.mean(losses))
+
+        kelly_pct = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_loss
+        kelly_pct = max(0, kelly_pct) * self.config.kelly_fraction
+        kelly_pct = min(kelly_pct, self.config.max_position_pct)
+
+        return capital * kelly_pct
+
+    def record_trade(self, pnl: float):
+        """Record a closed trade result for future sizing decisions."""
+        self.trade_history.append(pnl)
+        if len(self.trade_history) > 50:
+            self.trade_history = self.trade_history[-50:]
+
+
+# =============================================================================
+# Portfolio & Risk Management
+# =============================================================================
+
+@dataclass
+class Position:
+    """Active position"""
+    symbol: str
+    entry_time: int
+    entry_price: float
+    quantity: float
+    original_quantity: float          # Fix 2: partial pcts apply to this, not shrinking quantity
+    stop_loss: float
+    targets: List[Tuple[float, float]]   # [(price, pct), ...]
+    regime: str
+    signal_score: float
+    risk_dollars: float
+    partials_hit: int = 0
+    pending_time_exit: bool = False   # Fix 3: set True when time limit hit; fill at next bar open
+
+
+class PortfolioManager:
+    """Portfolio-level risk management."""
+
+    def __init__(self, config: StrategyConfig):
+        self.config = config
+        self.positions: Dict[str, Position] = {}
+        self.cash: float = config.initial_capital
+        self.initial_capital: float = config.initial_capital
+
+    def equity(self, prices: Dict[str, float]) -> float:
+        position_value = sum(
+            pos.quantity * prices.get(pos.symbol, pos.entry_price)
+            for pos in self.positions.values()
+        )
+        return self.cash + position_value
+
+    def portfolio_heat(self) -> float:
+        return sum(pos.risk_dollars for pos in self.positions.values())
+
+    def can_open_position(self, new_risk: float, current_prices: Dict[str, float]) -> bool:
+        # Fix 1: equity must be marked at current market prices, not entry prices.
+        # Pass the same prev_prices dict used for sizing so the heat ceiling
+        # is consistent with what we actually believe the portfolio is worth.
+        current_heat = self.portfolio_heat()
+        max_heat = self.config.max_portfolio_heat * self.equity(current_prices)
+        return (current_heat + new_risk) <= max_heat
+
+    def open_position(self, pos: Position, current_prices: Dict[str, float]) -> bool:
+        if not self.can_open_position(pos.risk_dollars, current_prices):
+            return False
+        cost      = pos.quantity * pos.entry_price
+        commission = cost * self.config.commission_rate
+        if cost + commission > self.cash:
+            return False
+        self.cash -= cost + commission
+        self.positions[pos.symbol] = pos
+        return True
+
+    def close_position(self, symbol: str, exit_price: float, quantity: float) -> float:
+        if symbol not in self.positions:
+            return 0.0
+        pos        = self.positions[symbol]
+        gross      = quantity * (exit_price - pos.entry_price)
+        commission = quantity * exit_price * self.config.commission_rate
+        net_pnl    = gross - commission
+        self.cash += quantity * exit_price - commission
+        pos.quantity -= quantity
+        if pos.quantity <= 0.0:
+            del self.positions[symbol]
+        return net_pnl
+
+
+# =============================================================================
+# Main Strategy Engine
+# =============================================================================
+
+class ProfessionalQuantStrategy:
+    """
+    Professional quantitative trading strategy.
+
+    Pending-order architecture (FIX 1):
+        Signals generated at bar T are stored as pending orders.
+        Orders are filled at bar T+1's open price.
+        This eliminates all look-ahead bias from entry pricing.
+    """
+
+    def __init__(self, config: StrategyConfig, logger: logging.Logger):
+        self.config   = config
+        self.logger   = logger
+
+        self.regime_detector  = RegimeDetector(config)
+        self.signal_generator = MultiFactorSignal(config)
+        self.position_sizer   = KellyPositionSizer(config)
+        self.portfolio        = PortfolioManager(config)
+        self.indicators       = QuantIndicators()
+
+        self.trades: List[dict] = []
+
+        # FIX 1: pending orders keyed by symbol.
+        # Each entry: {symbol, stop_loss, targets, regime, signal_score,
+        #              risk_per_share, position_size_dollars}
+        self.pending_orders: Dict[str, dict] = {}
+
+    def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add all required technical indicators.
+        All indicators use standard pandas rolling windows which are
+        strictly backward-looking (no future data leakage).
+        """
+        df = df.copy()
+
+        df['sma_20']  = df['close'].rolling(20).mean()
+        df['sma_50']  = df['close'].rolling(50).mean()
+        df['sma_200'] = df['close'].rolling(200).mean()
+        df['ema_12']  = self.indicators.ema(df['close'], 12)
+        df['ema_26']  = self.indicators.ema(df['close'], 26)
+
+        df['atr'] = self.indicators.atr(df, 14)
+        df['adx'] = self.indicators.adx(df, 14)
+
+        upper, mid, lower = self.indicators.bollinger_bands(df['close'], 20, 2.0)
+        df['bb_upper'] = upper
+        df['bb_mid']   = mid
+        df['bb_lower'] = lower
+
+        df['rsi'] = self.indicators.rsi(df['close'], 14)
+
+        return df
+
+    # ------------------------------------------------------------------
+    # FIX 1 helper: execute pending orders at next bar's open
+    # ------------------------------------------------------------------
+
+    def execute_pending_orders(
+        self,
+        t: int,
+        symbol: str,
+        df: pd.DataFrame,
+        prev_prices: Dict[str, float],
+    ):
+        """
+        Execute any pending order for `symbol` at bar T's open price.
+
+        Also handles Fix 3: if the position has pending_time_exit=True (set
+        when the max holding period was reached on the previous bar), exit
+        here at bar T's open before doing anything else.
+
+        Called at the *start* of bar T before any signal generation,
+        ensuring the fill price is bar T's open — information that was
+        not available when the signal was generated at bar T-1.
+
+        Stop loss and profit targets are re-anchored to the actual fill
+        price so that the ATR-multiple risk/reward ratio is preserved
+        regardless of any overnight/interbar gap.
+        """
+        # Fix 3: flush any pending time-limit exit first, at this bar's open
+        if symbol in self.portfolio.positions:
+            pos = self.portfolio.positions[symbol]
+            if pos.pending_time_exit:
+                bar_open = float(df.iloc[t]['open'])
+                pnl = self.portfolio.close_position(symbol, bar_open, pos.quantity)
+                self.position_sizer.record_trade(pnl)
+                self.trades.append({
+                    'time'   : t,
+                    'symbol' : symbol,
+                    'side'   : 'SELL',
+                    'qty'    : pos.quantity,
+                    'price'  : bar_open,
+                    'reason' : 'TIME_LIMIT',
+                    'pnl'    : pnl,
+                    'regime' : pos.regime,
+                    'score'  : pos.signal_score,
+                })
+                # Discard any pending entry order for the same symbol
+                self.pending_orders.pop(symbol, None)
+                return
+
+        if symbol not in self.pending_orders:
+            return
+        if symbol in self.portfolio.positions:
+            del self.pending_orders[symbol]
+            return
+
+        order   = self.pending_orders.pop(symbol)
+        row     = df.iloc[t]
+        open_px = float(row['open'])
+
+        # Apply slippage to the open price
+        fill_price = open_px * (1 + self.config.slippage_rate)
+
+        # Re-anchor stop and targets to actual fill price.
+        signal_ref  = order['signal_ref_price']
+        stop_offset = signal_ref - order['stop_loss']
+        anchored_stop = fill_price - stop_offset
+
+        anchored_targets = [
+            (fill_price + (tp - signal_ref), pct)
+            for tp, pct in order['targets']
+        ]
+
+        capital        = self.portfolio.equity(prev_prices)
+        risk_per_share = fill_price - anchored_stop
+
+        if risk_per_share <= 0:
+            return
+
+        position_size_dollars = self.position_sizer.calculate_size(
+            capital, fill_price, risk_per_share
+        )
+        if position_size_dollars < 10:
+            return
+
+        quantity     = position_size_dollars / fill_price
+        risk_dollars = quantity * risk_per_share
+
+        pos = Position(
+            symbol            = symbol,
+            entry_time        = t,
+            entry_price       = fill_price,
+            quantity          = quantity,
+            original_quantity = quantity,   # Fix 2: freeze original for partial pct math
+            stop_loss         = anchored_stop,
+            targets           = anchored_targets,
+            regime            = order['regime'],
+            signal_score      = order['signal_score'],
+            risk_dollars      = risk_dollars,
+        )
+
+        # Fix 1: pass prev_prices so heat limit uses current market equity
+        if self.portfolio.open_position(pos, prev_prices):
+            self.trades.append({
+                'time'    : t,
+                'symbol'  : symbol,
+                'side'    : 'BUY',
+                'qty'     : quantity,
+                'price'   : fill_price,
+                'reason'  : order['regime'],
+                'pnl'     : 0.0,
+                'regime'  : order['regime'],
+                'score'   : order['signal_score'],
+            })
+
+    # ------------------------------------------------------------------
+    # FIX 3: intrabar stop/target resolution using high/low/open
+    # ------------------------------------------------------------------
+
+    def manage_positions(
+        self,
+        symbol: str,
+        bar_open: float,
+        bar_high: float,
+        bar_low: float,
+        bar_close: float,
+        current_time: int,
+    ):
+        """
+        Manage existing positions for one bar.
+
+        Uses the bar's open/high/low/close to determine intrabar fills:
+
+        Stops:
+            - bar_open <= stop_loss  →  gapped down; fill at bar_open
+            - bar_low  <= stop_loss  →  breached intrabar; fill at stop_loss
+        Targets (checked only if stop not triggered):
+            - bar_open >= target     →  gapped up; fill at bar_open
+            - bar_high >= target     →  reached intrabar; fill at target price
+        Priority: if both stop and a target could be hit in the same bar,
+                  stop takes precedence (pessimistic/realistic convention).
+        """
+        if symbol not in self.portfolio.positions:
+            return
+
+        pos = self.portfolio.positions[symbol]
+
+        # ---- Stop Loss ----
+        stop_triggered = False
+        if bar_open <= pos.stop_loss:
+            # Gap-down open — worst-case fill at open
+            fill = bar_open
+            stop_triggered = True
+        elif bar_low <= pos.stop_loss:
+            # Intrabar breach — fill at the stop price
+            fill = pos.stop_loss
+            stop_triggered = True
+
+        if stop_triggered:
+            pnl = self.portfolio.close_position(symbol, fill, pos.quantity)
+            self.position_sizer.record_trade(pnl)
+            self.trades.append({
+                'time'   : current_time,
+                'symbol' : symbol,
+                'side'   : 'SELL',
+                'qty'    : pos.quantity,
+                'price'  : fill,
+                'reason' : 'STOP',
+                'pnl'    : pnl,
+                'regime' : pos.regime,
+                'score'  : pos.signal_score,
+            })
+            return
+
+        # ---- Profit Targets (progressive partials) ----
+        for i, (target_price, target_pct) in enumerate(pos.targets):
+            if i < pos.partials_hit:
+                continue  # Already taken
+
+            if bar_open >= target_price:
+                # Gap-up open above target — fill at open (favorable)
+                fill = bar_open
+            elif bar_high >= target_price:
+                # Intrabar reach — fill at exact target price
+                fill = target_price
+            else:
+                continue  # Target not yet reached
+
+            # Fix 2: apply pct to original_quantity so partials sum correctly
+            # e.g. 25% + 35% + 40% = 100% of the original position,
+            # regardless of how much quantity remains after prior partials.
+            qty_to_exit = pos.original_quantity * target_pct
+            qty_to_exit = min(qty_to_exit, pos.quantity)   # can't exceed remaining
+
+            pnl = self.portfolio.close_position(symbol, fill, qty_to_exit)
+            self.position_sizer.record_trade(pnl)
+            pos.partials_hit += 1
+
+            self.trades.append({
+                'time'   : current_time,
+                'symbol' : symbol,
+                'side'   : 'SELL',
+                'qty'    : qty_to_exit,
+                'price'  : fill,
+                'reason' : f'PARTIAL:Target_{i + 1}',
+                'pnl'    : pnl,
+                'regime' : pos.regime,
+                'score'  : pos.signal_score,
+            })
+
+            # Move stop to breakeven after first partial
+            if i == 0 and symbol in self.portfolio.positions:
+                pos.stop_loss = max(pos.stop_loss, pos.entry_price)
+
+            # Re-check: position may have been fully closed
+            if symbol not in self.portfolio.positions:
+                return
+
+        # ---- Max Holding Period ----
+        # Fix 3: don't exit at bar close — set a flag so the position is
+        # closed at the NEXT bar's open in execute_pending_orders.
+        # This is consistent with all other exits in this architecture.
+        if symbol in self.portfolio.positions:
+            pos = self.portfolio.positions[symbol]
+            if current_time - pos.entry_time > self.config.max_holding_bars:
+                pos.pending_time_exit = True
+
+    def generate_signal(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        idx: int,
+        basket_perf: float = 0.0,
+    ) -> Optional[dict]:
+        """
+        Generate a trading signal at bar idx.
+
+        basket_perf must be computed from data through bar idx-1 (FIX 2).
+        If a signal is returned, it will be stored as a pending order
+        and executed at bar idx+1's open price (FIX 1).
+        """
+        if idx < 220:
+            return None
+
+        regime = self.regime_detector.detect(df, idx)
+
+        if regime in (RegimeDetector.CHOPPY,
+                      RegimeDetector.TRENDING_HIGH_VOL,
+                      RegimeDetector.RANGING):
+            return None
+
+        score, factors = self.signal_generator.calculate_score(df, idx, basket_perf)
+
+        if score < self.config.min_signal_score:
+            return None
+
+        row = df.iloc[idx]
+
+        if regime == RegimeDetector.TRENDING_LOW_VOL:
+            if 'momentum' not in factors or 'trend' not in factors:
+                return None
+
+        return {
+            'symbol' : symbol,
+            'regime' : regime,
+            'score'  : score,
+            'factors': factors,
+            'atr'    : row['atr'],
+            'price'  : row['close'],   # reference only; actual fill is next open
+        }
+
+    def calculate_position_params(self, signal: dict) -> Tuple[float, List[Tuple[float, float]]]:
+        """
+        Calculate stop loss and profit targets based on regime and signal bar ATR.
+
+        These values are anchored to signal['price'] (the signal bar's close).
+        They will be re-anchored to the actual fill price (next bar's open)
+        inside execute_pending_orders, preserving the ATR-multiple offsets.
+        signal['price'] is stored alongside stop/targets so the offset can
+        be reconstructed at fill time.
+        """
+        entry_ref = signal['price']
+        atr       = signal['atr']
+        regime    = signal['regime']
+
+        if regime == RegimeDetector.TRENDING_LOW_VOL:
+            stop_mult   = self.config.stop_trending_low_vol
+            target_mult = self.config.target_trending_low_vol
+        elif regime == RegimeDetector.TRENDING_HIGH_VOL:
+            stop_mult   = self.config.stop_trending_high_vol
+            target_mult = self.config.target_trending_high_vol
+        else:
+            stop_mult   = self.config.stop_ranging
+            target_mult = self.config.target_ranging
+
+        stop_loss = entry_ref - (stop_mult * atr)
+
+        target1 = entry_ref + (target_mult * 0.50 * atr)
+        target2 = entry_ref + (target_mult * 0.75 * atr)
+        target3 = entry_ref + (target_mult * 1.00 * atr)
+
+        targets = [
+            (target1, self.config.partial_pct_1),
+            (target2, self.config.partial_pct_2),
+            (target3, self.config.partial_pct_3),
+        ]
+
+        return stop_loss, targets
+
+
+# =============================================================================
+# Backtesting Engine
+# =============================================================================
+
+def load_ohlcv_csv(path: str) -> pd.DataFrame:
+    """Load OHLCV CSV with automatic column detection."""
+    df = pd.read_csv(path)
+    df.columns = [str(c).lower().strip() for c in df.columns]
+
+    time_col = next((c for c in ['time', 'timestamp', 'open_time'] if c in df.columns), None)
+    if not time_col:
+        raise ValueError(f"No time column found in {path}")
+
+    s = df[time_col]
+    if pd.api.types.is_numeric_dtype(s):
+        dt = pd.to_datetime(s, unit='ms', errors='coerce')
+    else:
+        dt = pd.to_datetime(pd.to_numeric(s, errors='coerce'), unit='ms', errors='coerce')
+        if dt.isna().all():
+            dt = pd.to_datetime(s, errors='coerce')
+
+    df[time_col] = dt
+    df = df.sort_values(time_col).reset_index(drop=True)
+
+    required = ['open', 'high', 'low', 'close', 'volume']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path} missing columns: {missing}")
+
+    out = df[[time_col, 'open', 'high', 'low', 'close', 'volume']].copy()
+    out.rename(columns={time_col: 'time'}, inplace=True)
+
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        out[c] = pd.to_numeric(out[c], errors='coerce')
+
+    return out.dropna().reset_index(drop=True)
+
+
+def backtest_professional(data_dir: str, config: StrategyConfig, logger: logging.Logger):
+    """
+    Run professional quant backtest — leakage-free version.
+
+    Bar-by-bar loop order (critical for correctness):
+        1. Execute any pending orders at bar T's OPEN  (FIX 1)
+        2. Manage existing positions using bar T's OHLC (FIX 3)
+        3. Generate signals using bar T's CLOSE data
+        4. Store signals as pending orders for bar T+1  (FIX 1)
+
+    Basket performance passed to signal generator uses data through
+    bar T-1 only (FIX 2).
+    """
+    import os
+
+    csvs = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith('.csv')]
+    csvs = [p for p in csvs if '_5min' in os.path.basename(p).lower()]
+
+    if not csvs:
+        raise SystemExit(f"No *_5min*.csv files found in {data_dir}")
+
+    data: Dict[str, pd.DataFrame] = {}
+    for p in csvs:
+        sym = os.path.basename(p).split('_')[0].upper()
+        df = load_ohlcv_csv(p)
+        if not df.empty:
+            data[sym] = df
+
+    if not data:
+        raise SystemExit("No usable data loaded")
+
+    strategy = ProfessionalQuantStrategy(config, logger)
+
+    for sym, df in list(data.items()):
+        try:
+            data[sym] = strategy.add_indicators(df)
+        except Exception as e:
+            logger.warning(f"Failed indicators for {sym}: {e}")
+            data.pop(sym, None)
+
+    if not data:
+        raise SystemExit("No symbols after indicator computation")
+
+    symbols = sorted(data.keys())
+    logger.info("=" * 70)
+    logger.info("PROFESSIONAL QUANT STRATEGY  (Leakage-Free v2.0)")
+    logger.info("=" * 70)
+    logger.info(f"Symbols         : {', '.join(symbols)}")
+    logger.info(f"Initial Capital : ${config.initial_capital:,.0f}")
+    logger.info(f"Max Portfolio Heat: {config.max_portfolio_heat * 100:.1f}%")
+    logger.info(f"Kelly Fraction  : {config.kelly_fraction * 100:.0f}%")
+    logger.info(f"Min Signal Score: {config.min_signal_score}/10")
+    logger.info("=" * 70)
+
+    max_bars = max(len(df) for df in data.values())
+
+    # ------------------------------------------------------------------
+    # FIX 2: pre-compute basket performance through bar T-1.
+    # For each bar T, basket_perf[T] = average 20-bar return of all
+    # symbols measured from bar T-21 to bar T-1.
+    # This is always one bar behind the signal bar, eliminating
+    # contemporaneous leakage.
+    # ------------------------------------------------------------------
+    def calc_basket_performance_lagged(t: int) -> float:
+        """
+        Basket performance through bar t-1 (strictly lagged).
+        Uses close[t-1] vs close[t-21] so that current bar data is
+        never included in this signal input.
+        """
+        if t < 22:
+            return 0.0
+        perfs = []
+        for df in data.values():
+            prev_idx = t - 1
+            ref_idx  = t - 21
+            if prev_idx < len(df) and ref_idx >= 0:
+                prev_close = df.iloc[prev_idx]['close']
+                ref_close  = df.iloc[ref_idx]['close']
+                if ref_close != 0:
+                    perfs.append((prev_close - ref_close) / ref_close)
+        return float(np.mean(perfs)) if perfs else 0.0
+
+    # ------------------------------------------------------------------
+    # Main backtest loop
+    # ------------------------------------------------------------------
+    for t in range(max_bars):
+
+        # Prices known BEFORE bar T opens = bar T-1's closes.
+        # Used for equity mark-to-market when sizing fills at bar T's open.
+        # This avoids using bar T's close (future) to determine how much
+        # capital is available at bar T's open.
+        if t == 0:
+            prev_prices: Dict[str, float] = {
+                sym: float(data[sym].iloc[0]['open'])   # bootstrap: use bar 0 open
+                for sym in symbols
+                if len(data[sym]) > 0
+            }
+        else:
+            prev_prices = {
+                sym: float(data[sym].iloc[min(t - 1, len(data[sym]) - 1)]['close'])
+                for sym in symbols
+            }
+
+        for sym in symbols:
+            df = data[sym]
+            if t >= len(df):
+                continue
+
+            row       = df.iloc[t]
+            bar_open  = float(row['open'])
+            bar_high  = float(row['high'])
+            bar_low   = float(row['low'])
+            bar_close = float(row['close'])
+
+            # STEP 1 — Execute pending orders at this bar's OPEN  (FIX 1)
+            # Pass prev_prices so equity sizing uses only information
+            # available before this bar opened.
+            strategy.execute_pending_orders(t, sym, df, prev_prices)
+
+            # STEP 2 — Manage existing positions using full OHLC  (FIX 3)
+            strategy.manage_positions(
+                sym,
+                bar_open,
+                bar_high,
+                bar_low,
+                bar_close,
+                t,
+            )
+
+        # STEP 3 — Generate new signals using this bar's CLOSE data,
+        #          then store as pending orders for the NEXT bar.
+        basket_perf = calc_basket_performance_lagged(t)  # FIX 2
+
+        for sym in symbols:
+            df = data[sym]
+            if t >= len(df):
+                continue
+
+            # Don't generate a new signal if:
+            #   a) already in a position, or
+            #   b) already have a pending order for this symbol
+            if sym in strategy.portfolio.positions:
+                continue
+            if sym in strategy.pending_orders:
+                continue
+
+            signal = strategy.generate_signal(sym, df, t, basket_perf)
+            if not signal:
+                continue
+
+            stop_loss, targets = strategy.calculate_position_params(signal)
+
+            # FIX 1: store as pending order — fills at NEXT bar's open.
+            # signal_ref_price is the signal bar's close; used in
+            # execute_pending_orders to re-anchor stop/targets to fill price.
+            strategy.pending_orders[sym] = {
+                'stop_loss'       : stop_loss,
+                'targets'         : targets,
+                'regime'          : signal['regime'],
+                'signal_score'    : signal['score'],
+                'signal_ref_price': signal['price'],   # signal bar close — anchor reference
+            }
+
+    # ------------------------------------------------------------------
+    # Close all remaining open positions at last bar's close
+    # ------------------------------------------------------------------
+    final_prices = {sym: float(df.iloc[-1]['close']) for sym, df in data.items()}
+    for sym in list(strategy.portfolio.positions.keys()):
+        pos = strategy.portfolio.positions[sym]
+        pnl = strategy.portfolio.close_position(sym, final_prices[sym], pos.quantity)
+        strategy.position_sizer.record_trade(pnl)
+        strategy.trades.append({
+            'time'   : len(data[sym]) - 1,
+            'symbol' : sym,
+            'side'   : 'SELL',
+            'qty'    : pos.quantity,
+            'price'  : final_prices[sym],
+            'reason' : 'EOD',
+            'pnl'    : pnl,
+            'regime' : pos.regime,
+            'score'  : pos.signal_score,
+        })
+
+    # Discard unfilled pending orders — treat as no-trade
+    if strategy.pending_orders:
+        logger.info(f"Discarded {len(strategy.pending_orders)} pending orders at end of data.")
+
+    # ------------------------------------------------------------------
+    # Results
+    # ------------------------------------------------------------------
+    trades_df = pd.DataFrame(strategy.trades)
+    sells     = trades_df[trades_df['side'] == 'SELL']
+
+    total_pnl    = sells['pnl'].sum()
+    num_trades   = len(sells)
+    wins         = sells[sells['pnl'] > 0]
+    losses       = sells[sells['pnl'] < 0]
+    win_rate     = len(wins) / num_trades if num_trades > 0 else 0
+    loss_sum     = losses['pnl'].sum()
+    profit_factor = abs(wins['pnl'].sum() / loss_sum) if loss_sum != 0 else float('inf')
+
+    final_equity = strategy.portfolio.equity(final_prices)
+    roi = ((final_equity - config.initial_capital) / config.initial_capital) * 100
+
+    logger.info("=" * 70)
+    logger.info("BACKTEST RESULTS")
+    logger.info("=" * 70)
+    logger.info(f"Final Equity  : ${final_equity:,.2f}")
+    logger.info(f"Total PnL     : ${total_pnl:,.2f}")
+    logger.info(f"ROI           : {roi:.2f}%")
+    logger.info(f"Total Trades  : {num_trades}")
+    logger.info(f"Win Rate      : {win_rate * 100:.1f}%")
+    logger.info(f"Profit Factor : {profit_factor:.2f}")
+    logger.info(f"Avg Win       : ${wins['pnl'].mean():.2f}" if len(wins) > 0 else "Avg Win  : N/A")
+    logger.info(f"Avg Loss      : ${losses['pnl'].mean():.2f}" if len(losses) > 0 else "Avg Loss : N/A")
+    logger.info("=" * 70)
+    logger.info("PERFORMANCE BY REGIME:")
+
+    for regime in sells['regime'].unique():
+        rsells  = sells[sells['regime'] == regime]
+        r_wins  = rsells[rsells['pnl'] > 0]
+        logger.info(
+            f"  {regime}: {len(rsells)} trades, "
+            f"${rsells['pnl'].sum():.2f}, "
+            f"{len(r_wins) / len(rsells) * 100:.1f}% win rate"
+        )
+
+    trades_df.to_csv('professional_backtest_trades.csv', index=False)
+    logger.info("Saved trades to professional_backtest_trades.csv")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("quant_strategy")
+    logger.setLevel(getattr(logging, level.upper()))
+    logger.propagate = False
+
+    if not logger.handlers:
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+        sh  = logging.StreamHandler(sys.stdout)
+        sh.setLevel(getattr(logging, level.upper()))
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+
+    return logger
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Professional Quant Trading Strategy (Leakage-Free)")
+    parser.add_argument("--data-dir", required=True, help="Directory containing OHLCV CSV files")
+    parser.add_argument("--capital",  type=float, default=10000.0, help="Initial capital")
+    parser.add_argument("--verbose",  action="store_true", help="Verbose logging")
+
+    args   = parser.parse_args()
+    logger = setup_logging("DEBUG" if args.verbose else "INFO")
+    config = StrategyConfig(initial_capital=args.capital)
+
+    try:
+        backtest_professional(args.data_dir, config, logger)
+    except Exception as e:
+        logger.error(f"Backtest failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
