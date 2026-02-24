@@ -1,0 +1,1516 @@
+#!/usr/bin/env python3
+"""
+Day Trading — FIXED VERSION with Critical Bug Fixes
+======================================================
+
+CRITICAL FIXES (v2.0):
+1. 🐛 FIX: Same-bar entry/exit bug (skip_exit_until_ts)
+2. 🐛 FIX: Stops too tight for intraday (increased defaults, min stop distance)
+3. 🐛 FIX: Trailing stops never activating (profit-based activation)
+4. ✨ NEW: Time-of-day filter (avoid lunch hour)
+5. ✨ NEW: Adaptive RSI (gradient scoring vs hard filter)
+6. ✨ NEW: Market regime detection (reduce size in chop)
+
+IMPROVEMENTS from v1.0:
+1. ✅ Trailing stops - lock in profits
+2. ✅ Volume confirmation - filter weak signals
+3. ✅ Volatility-adjusted sizing - survive drawdowns
+4. ✅ Time-based exits - prevent dead money
+5. ✅ Enhanced metrics - Sharpe, Max DD, Calmar
+
+Usage:
+  python3 day_trading.py backtest --csv AAPL=aapl.csv
+  python3 day_trading.py live --tickers AAPL MSFT
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import math
+import os
+import time
+from datetime import datetime, time as dt_time
+
+import numpy as np
+import pandas as pd
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+
+# ----------------------------
+# Configuration
+# ----------------------------
+
+DEFAULT_PARAMS = {
+    # portfolio / risk
+    "initial_cash": 100_000.0,
+    "risk_per_trade": 0.005,
+    "max_positions": 2,
+    "cooldown_bars": 5,
+    "max_pos_value_frac": 0.50,
+
+    # costs
+    "commission_per_share": 0.005,
+    "slippage_bps": 0.0005,
+
+    # indicators
+    "rsi_period": 14,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "atr_period": 14,
+    "sma_fast": 20,
+    "sma_slow": 50,
+
+    # signals
+    "rsi_oversold": 35,
+    "rsi_use_gradient": True,       # FIX #5: Use adaptive RSI
+    "breakout_lookback": 20,
+    "breakout_buffer": 0.0010,
+
+    # regime
+    "enable_regime_gate": True,
+
+    # linear regression
+    "lr_period": 60,
+    "lr_use_log": True,
+    "lr_min_r2": 0.20,
+    "lr_min_slope": 0.0,
+    "lr_z_entry": -1.0,
+    "lr_z_breakout": +1.0,
+
+    # exits - FIX #2: Wider defaults for intraday
+    "atr_stop": 2.0,                # Increased from 1.2
+    "atr_target": 3.0,              # Increased from 2.0
+    "stop_first_if_both": True,
+    "min_stop_distance_pct": 0.003, # FIX #2: Minimum 0.3% stop
+
+    # trailing stops - FIX #3: Profit-based activation
+    "enable_trailing_stop": True,
+    "trailing_stop_activation_pct": 0.005,  # Activate after 0.5% profit
+    "trailing_stop_distance_pct": 0.003,    # Trail 0.3% below high
+    
+    # volume filter
+    "enable_volume_filter": True,
+    "min_volume_ratio": 0.5,
+    "volume_lookback": 20,
+    
+    # volatility adjustment
+    "enable_vol_adjustment": True,
+    "vol_lookback": 60,
+    
+    # time exits
+    "enable_time_exit": True,
+    "max_hold_bars": 50,
+
+    # execution - FIX #1: Skip same-bar exits
+    "enter_on_next_open": True,
+    "skip_entry_bar_exits": True,   # FIX #1: Don't exit on entry bar
+    "gap_fill_model": True,
+    
+    # FIX #4: Time-of-day filter
+    "enable_trading_hours": True,
+    "trading_hours_start": "09:30",
+    "trading_hours_end": "16:00",
+    "avoid_lunch": True,
+    "lunch_start": "12:00",
+    "lunch_end": "13:30",
+    
+    # FIX #6: Market regime awareness
+    "enable_regime_sizing": True,
+    "ranging_size_reduction": 0.5,  # Half size in choppy markets
+    
+    # debug
+    "debug_signals": False,
+}
+
+
+# ----------------------------
+# Data Structures
+# ----------------------------
+
+@dataclass
+class Signal:
+    ticker: str
+    direction: int
+    strength: float = 1.0
+    tag: str = ""
+
+
+@dataclass
+class Position:
+    ticker: str
+    qty: int
+    entry_price: float
+    entry_price_raw: float
+    entry_ts: pd.Timestamp
+    entry_bar_index: int
+    stop: float
+    target: float
+    tag: str = ""
+    
+    entry_commission: float = 0.0
+    entry_slippage: float = 0.0
+    
+    # Trailing stops - FIX #3: Profit-based
+    trailing_stop: Optional[float] = None
+    highest_price: float = 0.0
+    trailing_activated: bool = False
+    
+    # FIX #1: Skip exit on entry bar
+    skip_exit_until_ts: Optional[pd.Timestamp] = None
+
+
+@dataclass
+class Fill:
+    ticker: str
+    qty: int
+    price: float
+    ts: pd.Timestamp
+    side: str
+    commission: float
+    slippage: float
+    tag: str = ""
+
+
+@dataclass
+class TradeRecord:
+    ticker: str
+    entry_ts: pd.Timestamp
+    exit_ts: pd.Timestamp
+    qty: int
+    entry_price: float
+    exit_price: float
+    pnl: float
+    gross_pnl: float
+    costs: float
+    tag: str
+    bars_held: int = 0
+
+
+# ----------------------------
+# OHLCV normalization
+# ----------------------------
+
+def _to_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise ValueError("Empty dataframe provided.")
+
+    cols = {c.lower(): c for c in df.columns}
+    required = ["open", "high", "low", "close"]
+    for r in required:
+        if r not in cols:
+            raise ValueError(f"Missing required column '{r}' (case-insensitive). Found: {list(df.columns)}")
+
+    if "timestamp" in cols:
+        ts_col = cols["timestamp"]
+        out = df.copy()
+        out[ts_col] = pd.to_datetime(out[ts_col], utc=False, errors="coerce")
+        out = out.dropna(subset=[ts_col]).sort_values(ts_col)
+        out = out.set_index(ts_col)
+    else:
+        out = df.copy()
+        out.index = pd.to_datetime(out.index, utc=False, errors="coerce")
+        out = out.sort_index()
+        out = out[~out.index.isna()]
+
+    out = out.rename(columns={
+        cols["open"]: "Open",
+        cols["high"]: "High",
+        cols["low"]: "Low",
+        cols["close"]: "Close",
+    })
+
+    if "volume" in cols:
+        out = out.rename(columns={cols["volume"]: "Volume"})
+    else:
+        out["Volume"] = 0.0
+
+    return out[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+
+
+# ----------------------------
+# Indicators
+# ----------------------------
+
+def rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / (avg_loss.replace(0.0, np.nan))
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out.fillna(50.0)
+
+
+def bollinger(close: pd.Series, period: int, n_std: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ma = close.rolling(period, min_periods=period).mean()
+    sd = close.rolling(period, min_periods=period).std(ddof=0)
+    upper = ma + n_std * sd
+    lower = ma - n_std * sd
+    return ma, upper, lower
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+def sma(x: pd.Series, period: int) -> pd.Series:
+    return x.rolling(period, min_periods=period).mean()
+
+
+def rolling_linreg_features(close: pd.Series, period: int, use_log: bool) -> pd.DataFrame:
+    n = int(period)
+    if n < 5:
+        raise ValueError("lr_period must be >= 5")
+
+    y = close.astype(float).copy()
+    if use_log:
+        y = np.log(y.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    x = np.arange(n, dtype=float)
+    x_mean = x.mean()
+    x_demean = x - x_mean
+    x_var = (x_demean ** 2).sum()
+
+    slopes = np.full(len(close), np.nan, dtype=float)
+    r2s = np.full(len(close), np.nan, dtype=float)
+    preds = np.full(len(close), np.nan, dtype=float)
+    resid_stds = np.full(len(close), np.nan, dtype=float)
+    zs = np.full(len(close), np.nan, dtype=float)
+
+    arr = y.to_numpy()
+
+    for i in range(n - 1, len(arr)):
+        window = arr[i - n + 1:i + 1]
+        if np.any(np.isnan(window)):
+            continue
+
+        y_mean = window.mean()
+        y_demean = window - y_mean
+
+        cov = (x_demean * y_demean).sum()
+        slope = cov / x_var
+        intercept = y_mean - slope * x_mean
+
+        y_hat = intercept + slope * x
+        resid = window - y_hat
+
+        ss_tot = (y_demean ** 2).sum()
+        ss_res = (resid ** 2).sum()
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+        resid_std = resid.std(ddof=0)
+        last_y = window[-1]
+        last_pred = y_hat[-1]
+        z = (last_y - last_pred) / resid_std if resid_std > 0 else 0.0
+
+        slopes[i] = slope
+        r2s[i] = r2
+        preds[i] = last_pred
+        resid_stds[i] = resid_std
+        zs[i] = z
+
+    out = pd.DataFrame(index=close.index, data={
+        "LR_Slope": slopes,
+        "LR_R2": r2s,
+        "LR_Pred": preds,
+        "LR_ResidStd": resid_stds,
+        "LR_Z": zs,
+    })
+
+    if use_log:
+        out["LR_Pred"] = np.exp(out["LR_Pred"])
+    return out
+
+
+def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    df = df.copy()
+    df["RSI"] = rsi(df["Close"], params["rsi_period"])
+    bb_mid, bb_up, bb_lo = bollinger(df["Close"], params["bb_period"], params["bb_std"])
+    df["BB_Mid"] = bb_mid
+    df["BB_Upper"] = bb_up
+    df["BB_Lower"] = bb_lo
+    df["ATR"] = atr(df["High"], df["Low"], df["Close"], params["atr_period"])
+    df["SMA_Fast"] = sma(df["Close"], params["sma_fast"])
+    df["SMA_Slow"] = sma(df["Close"], params["sma_slow"])
+
+    lr = rolling_linreg_features(df["Close"], params["lr_period"], params["lr_use_log"])
+    df = df.join(lr)
+    
+    if params.get("enable_vol_adjustment", True):
+        vol_lb = params.get("vol_lookback", 60)
+        df["ATR_Avg"] = df["ATR"].rolling(vol_lb, min_periods=vol_lb).mean()
+
+    return df
+
+
+# ----------------------------
+# FIX #6: Market Regime Detection
+# ----------------------------
+
+def detect_market_regime(df: pd.DataFrame) -> str:
+    """
+    Detect if market is TRENDING or RANGING.
+    Used to reduce position size during chop.
+    """
+    if len(df) < 50:
+        return "UNKNOWN"
+    
+    # Measure price range over last 20 bars
+    tail = df.tail(20)
+    high_20 = tail["High"].max()
+    low_20 = tail["Low"].min()
+    current_price = df["Close"].iloc[-1]
+    
+    range_pct = (high_20 - low_20) / current_price if current_price > 0 else 0
+    
+    # Check trend strength via regression R²
+    r2 = df["LR_R2"].iloc[-1] if not np.isnan(df["LR_R2"].iloc[-1]) else 0
+    
+    # Ranging if: tight range AND low R²
+    if range_pct < 0.015 or r2 < 0.10:  # Less than 1.5% range OR poor fit
+        return "RANGING"
+    else:
+        return "TRENDING"
+
+
+# ----------------------------
+# FIX #4: Time-of-Day Filter
+# ----------------------------
+
+def is_trading_hours(ts: pd.Timestamp, params: dict) -> bool:
+    """Check if timestamp is within allowed trading hours"""
+    if not params.get("enable_trading_hours", False):
+        return True
+    
+    try:
+        time_obj = ts.time()
+        
+        # Parse hours
+        start_str = params.get("trading_hours_start", "09:30")
+        end_str = params.get("trading_hours_end", "16:00")
+        start_time = datetime.strptime(start_str, "%H:%M").time()
+        end_time = datetime.strptime(end_str, "%H:%M").time()
+        
+        # Check if outside trading hours
+        if time_obj < start_time or time_obj > end_time:
+            return False
+        
+        # Check lunch hour
+        if params.get("avoid_lunch", False):
+            lunch_start_str = params.get("lunch_start", "12:00")
+            lunch_end_str = params.get("lunch_end", "13:30")
+            lunch_start = datetime.strptime(lunch_start_str, "%H:%M").time()
+            lunch_end = datetime.strptime(lunch_end_str, "%H:%M").time()
+            
+            if lunch_start <= time_obj <= lunch_end:
+                return False
+        
+        return True
+    except:
+        # If any parsing error, allow trading
+        return True
+
+
+# ----------------------------
+# Signals
+# ----------------------------
+
+def momentum_breakout(df: pd.DataFrame, params: dict) -> bool:
+    lb = params["breakout_lookback"]
+    if len(df) < lb + 2:
+        return False
+    recent_high = df["High"].iloc[-(lb+1):-1].max()
+    c = df["Close"].iloc[-1]
+    return c > recent_high * (1.0 + params["breakout_buffer"])
+
+
+def lr_regime_ok(df: pd.DataFrame, params: dict) -> bool:
+    if len(df) < max(params["lr_period"], params["sma_slow"]) + 2:
+        return False
+
+    slope = df["LR_Slope"].iloc[-1]
+    r2 = df["LR_R2"].iloc[-1]
+    sslow = df["SMA_Slow"].iloc[-1]
+    c = df["Close"].iloc[-1]
+
+    if np.isnan(slope) or np.isnan(r2) or np.isnan(sslow):
+        return False
+
+    if params.get("enable_regime_gate", True):
+        if c < sslow:
+            return False
+        if r2 < params["lr_min_r2"]:
+            return False
+        if slope < params["lr_min_slope"]:
+            return False
+    return True
+
+
+def volume_ok(df: pd.DataFrame, params: dict) -> bool:
+    """Check if current volume is sufficient"""
+    if not params.get("enable_volume_filter", True):
+        return True
+    
+    if len(df) < params["volume_lookback"] + 1:
+        return True
+    
+    current_vol = df["Volume"].iloc[-1]
+    avg_vol = df["Volume"].iloc[-params["volume_lookback"]:-1].mean()
+    
+    if avg_vol <= 0:
+        return True
+    
+    vol_ratio = current_vol / avg_vol
+    min_ratio = params.get("min_volume_ratio", 0.5)
+    
+    return vol_ratio >= min_ratio
+
+
+def generate_signal(df: pd.DataFrame, ticker: str, params: dict) -> Optional[Signal]:
+    """
+    Long-only signals with FIX #5: Adaptive RSI (gradient scoring).
+    """
+    debug = params.get("debug_signals", False)
+    
+    if len(df) < max(params["lr_period"], params["bb_period"], params["rsi_period"]) + 2:
+        return None
+
+    last = df.iloc[-1]
+    c = float(last["Close"])
+    z = float(last["LR_Z"]) if not np.isnan(last["LR_Z"]) else 0.0
+    rsi_v = float(last["RSI"]) if not np.isnan(last["RSI"]) else 50.0
+
+    # FIX #4: Check trading hours
+    if not is_trading_hours(df.index[-1], params):
+        if debug:
+            print(f"  [{ticker}] REJECTED: Outside trading hours")
+        return None
+
+    regime_ok = lr_regime_ok(df, params)
+    vol_ok = volume_ok(df, params)
+    
+    if not vol_ok:
+        if debug:
+            print(f"  [{ticker}] REJECTED: Low volume")
+        return None
+
+    if regime_ok:
+        # FIX #5: Adaptive RSI - gradient scoring instead of hard filter
+        if z <= params["lr_z_entry"]:
+            if params.get("rsi_use_gradient", True):
+                # Score: 0 (RSI=70) to 1 (RSI=0)
+                rsi_score = max(0.0, (70 - rsi_v) / 70)
+                z_score = abs(z)
+                
+                # Trigger if EITHER very oversold OR deep Z-score
+                if z_score > 1.5 or rsi_v < params["rsi_oversold"]:
+                    strength = z_score + rsi_score
+                    return Signal(ticker=ticker, direction=+1, strength=float(strength), tag="REG_DIP_Z")
+                elif debug:
+                    print(f"  [{ticker}] WEAK: Z={z:.2f}, RSI={rsi_v:.1f} (need Z>1.5 or RSI<{params['rsi_oversold']})")
+            else:
+                # Original hard filter
+                if rsi_v <= params["rsi_oversold"]:
+                    strength = min(3.0, abs(z)) + (max(0.0, (params["rsi_oversold"] - rsi_v)) / 10.0)
+                    return Signal(ticker=ticker, direction=+1, strength=float(strength), tag="REG_DIP_Z")
+                elif debug:
+                    print(f"  [{ticker}] ALMOST: Z={z:.2f}✅ but RSI={rsi_v:.1f} > {params['rsi_oversold']} ❌")
+
+        # Momentum breakout
+        if z >= params["lr_z_breakout"] or momentum_breakout(df, params):
+            strength = min(3.0, max(0.0, z)) + (1.0 if momentum_breakout(df, params) else 0.0)
+            return Signal(ticker=ticker, direction=+1, strength=float(strength), tag="REG_MOM_Z")
+    else:
+        if debug and (z <= params["lr_z_entry"] or z >= params["lr_z_breakout"]):
+            print(f"  [{ticker}] REJECTED: Regime filter blocked (Z={z:.2f})")
+
+    if not params.get("enable_regime_gate", True):
+        if momentum_breakout(df, params):
+            return Signal(ticker=ticker, direction=+1, strength=1.0, tag="MOM_BREAKOUT")
+
+    return None
+
+
+# ----------------------------
+# Execution + Costs
+# ----------------------------
+
+def apply_slippage(price: float, side: str, params: dict) -> Tuple[float, float]:
+    bps = float(params["slippage_bps"])
+    if side == "BUY":
+        slip = price * bps
+        return price + slip, slip
+    slip = price * bps
+    return price - slip, slip
+
+
+def commission(qty: int, params: dict) -> float:
+    return float(abs(qty)) * float(params["commission_per_share"])
+
+
+def exit_check_bar_highlow_with_gaps(bar: pd.Series, pos: Position, params: dict) -> Optional[Tuple[float, str]]:
+    """
+    Check for exits (stop, target, trailing).
+    Returns (raw_exit_px_before_slippage, reason)
+    """
+    o = float(bar["Open"])
+    lo = float(bar["Low"])
+    hi = float(bar["High"])
+
+    static_stop_hit = lo <= pos.stop
+    target_hit = hi >= pos.target
+    trailing_stop_hit = False
+    if pos.trailing_stop is not None:
+        trailing_stop_hit = lo <= pos.trailing_stop
+
+    def stop_fill() -> float:
+        if params.get("gap_fill_model", True) and o < pos.stop:
+            return o
+        return pos.stop
+
+    def target_fill() -> float:
+        if params.get("gap_fill_model", True) and o > pos.target:
+            return o
+        return pos.target
+    
+    def trailing_fill() -> float:
+        if params.get("gap_fill_model", True) and o < pos.trailing_stop:
+            return o
+        return pos.trailing_stop
+
+    # Priority: trailing > static stop > target
+    if trailing_stop_hit:
+        return trailing_fill(), "TRAILING_STOP"
+    
+    if static_stop_hit and target_hit:
+        if params.get("stop_first_if_both", True):
+            return stop_fill(), "STOP_AND_TARGET_STOP_FIRST"
+        return target_fill(), "STOP_AND_TARGET_TARGET_FIRST"
+
+    if static_stop_hit:
+        return stop_fill(), "STOP"
+    if target_hit:
+        return target_fill(), "TARGET"
+
+    return None
+
+
+# ----------------------------
+# Portfolio
+# ----------------------------
+
+class Portfolio:
+    def __init__(self, initial_cash: float):
+        self.cash: float = float(initial_cash)
+        self.positions: Dict[str, Position] = {}
+        self.last_exit_bar_index: Dict[str, int] = {}
+        self.fills: List[Fill] = []
+        self.trades: List[TradeRecord] = []
+        self.equity_curve: List[Tuple[pd.Timestamp, float]] = []
+
+    def equity(self, last_prices: Dict[str, float]) -> float:
+        eq = self.cash
+        for t, p in self.positions.items():
+            px = float(last_prices.get(t, p.entry_price))
+            eq += p.qty * px
+        return float(eq)
+
+    def can_enter(self, ticker: str, bar_index: int, params: dict) -> bool:
+        if ticker in self.positions:
+            return False
+        if len(self.positions) >= int(params["max_positions"]):
+            return False
+        last_exit = self.last_exit_bar_index.get(ticker, -10**9)
+        return (bar_index - last_exit) >= int(params["cooldown_bars"])
+
+    def size_position(self, equity: float, entry: float, stop: float, atr_current: float, 
+                     atr_avg: float, params: dict, market_regime: str = "TRENDING") -> int:
+        """
+        FIX #6: Reduce size during RANGING markets.
+        FIX #3: Volatility-adjusted sizing.
+        """
+        base_risk_dollars = float(equity) * float(params["risk_per_trade"])
+        
+        # FIX #6: Regime-based size reduction
+        if params.get("enable_regime_sizing", True) and market_regime == "RANGING":
+            size_multiplier = params.get("ranging_size_reduction", 0.5)
+            base_risk_dollars *= size_multiplier
+        
+        # Volatility adjustment
+        if params.get("enable_vol_adjustment", True) and atr_avg > 0:
+            vol_ratio = atr_current / atr_avg
+            vol_adjustment = min(1.2, max(0.5, 1.0 / vol_ratio))
+            adjusted_risk = base_risk_dollars * vol_adjustment
+        else:
+            adjusted_risk = base_risk_dollars
+        
+        per_share_risk = abs(entry - stop)
+        if per_share_risk <= 0:
+            return 0
+        
+        qty = int(adjusted_risk / per_share_risk)
+        return max(qty, 0)
+
+    def open_position(
+        self,
+        ts: pd.Timestamp,
+        bar_index: int,
+        ticker: str,
+        entry_px_raw: float,
+        df_row: pd.Series,
+        tag: str,
+        params: dict,
+        last_prices: Dict[str, float],
+        market_regime: str = "TRENDING",
+    ) -> Optional[Fill]:
+        atr_v = float(df_row.get("ATR", np.nan))
+        if np.isnan(atr_v) or atr_v <= 0:
+            return None
+
+        entry_px_slipped, entry_slip_per_share = apply_slippage(entry_px_raw, "BUY", params)
+
+        # FIX #2: Calculate stops with minimum distance
+        stop_distance = float(params["atr_stop"]) * atr_v
+        min_stop_pct = params.get("min_stop_distance_pct", 0.003)
+        min_stop_distance = entry_px_slipped * min_stop_pct
+        
+        # Use larger of ATR-based or minimum
+        actual_stop_distance = max(stop_distance, min_stop_distance)
+        
+        stop = entry_px_slipped - actual_stop_distance
+        target = entry_px_slipped + float(params["atr_target"]) * atr_v
+
+        atr_avg = float(df_row.get("ATR_Avg", atr_v))
+        if np.isnan(atr_avg) or atr_avg <= 0:
+            atr_avg = atr_v
+
+        eq = self.equity(last_prices)
+        qty = self.size_position(eq, entry_px_slipped, stop, atr_v, atr_avg, params, market_regime)
+        if qty <= 0:
+            return None
+
+        # Cap by max position value
+        max_frac = float(params.get("max_pos_value_frac", 1.0))
+        if max_frac < 1.0:
+            max_value = eq * max_frac
+            qty = min(qty, int(max_value / entry_px_slipped))
+        if qty <= 0:
+            return None
+
+        # Affordability
+        if qty * entry_px_slipped > self.cash:
+            qty = int(self.cash / entry_px_slipped)
+        if qty <= 0:
+            return None
+
+        entry_comm = commission(qty, params)
+        total_cash_out = qty * entry_px_slipped + entry_comm
+        if total_cash_out > self.cash:
+            return None
+
+        self.cash -= total_cash_out
+
+        # FIX #1: Set skip_exit_until_ts
+        skip_until = ts if params.get("skip_entry_bar_exits", True) else None
+
+        pos = Position(
+            ticker=ticker,
+            qty=qty,
+            entry_price=entry_px_slipped,
+            entry_price_raw=entry_px_raw,
+            entry_ts=ts,
+            entry_bar_index=bar_index,
+            stop=stop,
+            target=target,
+            tag=tag,
+            entry_commission=entry_comm,
+            entry_slippage=(entry_px_slipped - entry_px_raw) * qty,
+            highest_price=entry_px_slipped,
+            skip_exit_until_ts=skip_until,
+        )
+        self.positions[ticker] = pos
+
+        fill = Fill(
+            ticker=ticker,
+            qty=qty,
+            price=entry_px_slipped,
+            ts=ts,
+            side="BUY",
+            commission=entry_comm,
+            slippage=entry_slip_per_share * qty,
+            tag=tag,
+        )
+        self.fills.append(fill)
+        return fill
+
+    def close_position(
+        self,
+        ts: pd.Timestamp,
+        bar_index: int,
+        ticker: str,
+        raw_exit_px: float,
+        reason: str,
+        params: dict,
+    ) -> Optional[Fill]:
+        pos = self.positions.get(ticker)
+        if not pos:
+            return None
+
+        qty = pos.qty
+
+        exit_px_slipped, exit_slip_per_share = apply_slippage(raw_exit_px, "SELL", params)
+        exit_comm = commission(qty, params)
+
+        cash_in = qty * exit_px_slipped - exit_comm
+        self.cash += cash_in
+
+        gross_pnl = (raw_exit_px - pos.entry_price_raw) * qty
+        net_pnl = (exit_px_slipped - pos.entry_price) * qty - pos.entry_commission - exit_comm
+
+        exit_slippage_total = (raw_exit_px - exit_px_slipped) * qty
+        costs = pos.entry_commission + exit_comm + pos.entry_slippage + exit_slippage_total
+
+        bars_held = bar_index - pos.entry_bar_index
+
+        self.trades.append(TradeRecord(
+            ticker=ticker,
+            entry_ts=pos.entry_ts,
+            exit_ts=ts,
+            qty=qty,
+            entry_price=pos.entry_price,
+            exit_price=exit_px_slipped,
+            pnl=net_pnl,
+            gross_pnl=gross_pnl,
+            costs=costs,
+            tag=f"{pos.tag}|{reason}",
+            bars_held=bars_held,
+        ))
+
+        fill = Fill(
+            ticker=ticker,
+            qty=qty,
+            price=exit_px_slipped,
+            ts=ts,
+            side="SELL",
+            commission=exit_comm,
+            slippage=exit_slip_per_share * qty,
+            tag=f"{pos.tag}|{reason}",
+        )
+        self.fills.append(fill)
+
+        del self.positions[ticker]
+        self.last_exit_bar_index[ticker] = bar_index
+        return fill
+    
+    def update_trailing_stops(self, last_prices: Dict[str, float], params: dict):
+        """
+        FIX #3: Profit-based trailing stop activation.
+        """
+        if not params.get("enable_trailing_stop", True):
+            return
+        
+        activation_pct = params.get("trailing_stop_activation_pct", 0.005)
+        trail_pct = params.get("trailing_stop_distance_pct", 0.003)
+        
+        for ticker, pos in self.positions.items():
+            current_price = last_prices.get(ticker)
+            if current_price is None:
+                continue
+            
+            # Update highest price
+            if current_price > pos.highest_price:
+                pos.highest_price = current_price
+            
+            # Calculate profit percentage
+            profit_pct = (pos.highest_price - pos.entry_price) / pos.entry_price
+            
+            # FIX #3: Activate after minimum profit threshold
+            if not pos.trailing_activated and profit_pct >= activation_pct:
+                pos.trailing_activated = True
+            
+            # Update trailing stop if activated
+            if pos.trailing_activated:
+                new_trailing = pos.highest_price * (1 - trail_pct)
+                
+                # Only move trailing stop up
+                if pos.trailing_stop is None or new_trailing > pos.trailing_stop:
+                    pos.trailing_stop = new_trailing
+
+
+# ----------------------------
+# Backtest Engine
+# ----------------------------
+
+def align_time_index(dfs: Dict[str, pd.DataFrame]) -> pd.DatetimeIndex:
+    idx = None
+    for df in dfs.values():
+        idx = df.index if idx is None else idx.union(df.index)
+    return idx.sort_values()
+
+
+def run_backtest(dfs: Dict[str, pd.DataFrame], params: dict) -> Portfolio:
+    dfs_ind = {t: add_indicators(df, params) for t, df in dfs.items()}
+    timeline = align_time_index(dfs_ind)
+
+    pf = Portfolio(params["initial_cash"])
+
+    pending: Dict[str, Tuple[Signal, int]] = {}
+    last_prices: Dict[str, float] = {}
+
+    for bar_index, ts in enumerate(timeline):
+        # Update MTM prices
+        for t, df in dfs_ind.items():
+            if ts in df.index:
+                last_prices[t] = float(df.loc[ts, "Close"])
+
+        # Track equity
+        if bar_index % 10 == 0 or bar_index == len(timeline) - 1:
+            pf.equity_curve.append((ts, pf.equity(last_prices)))
+
+        # Update trailing stops
+        pf.update_trailing_stops(last_prices, params)
+
+        # Check exits
+        for t in list(pf.positions.keys()):
+            df = dfs_ind.get(t)
+            if df is None or ts not in df.index:
+                continue
+            
+            bar = df.loc[ts]
+            pos = pf.positions[t]
+            
+            # FIX #1: Skip exit checks on entry bar
+            if pos.skip_exit_until_ts and ts <= pos.skip_exit_until_ts:
+                continue
+            
+            # Time-based exit
+            if params.get("enable_time_exit", True):
+                bars_held = bar_index - pos.entry_bar_index
+                if bars_held >= params["max_hold_bars"]:
+                    pf.close_position(ts, bar_index, t, float(bar["Close"]), "TIME_EXIT", params)
+                    continue
+            
+            # Regular exits
+            trig = exit_check_bar_highlow_with_gaps(bar, pos, params)
+            if trig:
+                raw_exit_px, reason = trig
+                pf.close_position(ts, bar_index, t, raw_exit_px, reason, params)
+
+        # Fill pending entries
+        if params.get("enter_on_next_open", True):
+            for t in list(pending.keys()):
+                sig, created_idx = pending[t]
+                if created_idx != bar_index - 1:
+                    continue
+                if t in pf.positions:
+                    del pending[t]
+                    continue
+                df = dfs_ind.get(t)
+                if df is None or ts not in df.index:
+                    continue
+                bar = df.loc[ts]
+                entry_px = float(bar["Open"])
+                if pf.can_enter(t, bar_index, params):
+                    # FIX #6: Pass market regime
+                    regime = detect_market_regime(df.loc[:ts])
+                    pf.open_position(ts, bar_index, t, entry_px, bar, sig.tag, params, last_prices, regime)
+                del pending[t]
+
+        # Generate signals
+        for t, df in dfs_ind.items():
+            if ts not in df.index:
+                continue
+            if not pf.can_enter(t, bar_index, params):
+                continue
+
+            sig = generate_signal(df.loc[:ts], t, params)
+            if sig:
+                if params.get("enter_on_next_open", True):
+                    pending[t] = (sig, bar_index)
+                else:
+                    entry_px = float(df.loc[ts, "Close"])
+                    regime = detect_market_regime(df.loc[:ts])
+                    pf.open_position(ts, bar_index, t, entry_px, df.loc[ts], sig.tag, params, last_prices, regime)
+
+    return pf
+
+
+# ----------------------------
+# Reporting
+# ----------------------------
+
+def compute_metrics(trades: List[TradeRecord], equity_curve: List[Tuple[pd.Timestamp, float]], initial_cash: float) -> Dict[str, float]:
+    if not trades:
+        return {
+            "trades": 0,
+            "win_rate": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "expectancy": 0.0,
+            "profit_factor": 0.0,
+            "gross_pnl": 0.0,
+            "net_pnl": 0.0,
+            "costs": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_pct": 0.0,
+            "calmar_ratio": 0.0,
+            "avg_bars_held": 0.0,
+            "max_bars_held": 0,
+        }
+
+    pnls = np.array([t.pnl for t in trades], dtype=float)
+    gross = np.array([t.gross_pnl for t in trades], dtype=float)
+    costs = np.array([t.costs for t in trades], dtype=float)
+    bars_held = np.array([t.bars_held for t in trades], dtype=float)
+
+    wins = pnls[pnls > 0]
+    losses = pnls[pnls < 0]
+
+    win_rate = float((pnls > 0).mean())
+    avg_win = float(wins.mean()) if len(wins) else 0.0
+    avg_loss = float(losses.mean()) if len(losses) else 0.0
+    expectancy = float(pnls.mean())
+
+    gross_profit = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = float(-losses.sum()) if len(losses) else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (math.inf if gross_profit > 0 else 0.0)
+
+    sharpe_ratio = 0.0
+    max_drawdown = 0.0
+    max_drawdown_pct = 0.0
+    calmar_ratio = 0.0
+    
+    if len(equity_curve) > 1:
+        eq_df = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
+        eq_df = eq_df.set_index("timestamp")
+        
+        returns = eq_df["equity"].pct_change().dropna()
+        
+        if len(returns) > 0 and returns.std() > 0:
+            sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252)
+        
+        cumulative = eq_df["equity"]
+        running_max = cumulative.expanding().max()
+        drawdown = cumulative - running_max
+        drawdown_pct = drawdown / running_max
+        
+        max_drawdown = float(drawdown.min())
+        max_drawdown_pct = float(drawdown_pct.min())
+        
+        if len(eq_df) > 1:
+            days = (eq_df.index[-1] - eq_df.index[0]).days
+            if days > 0:
+                years = days / 365.25
+                final_equity = eq_df["equity"].iloc[-1]
+                cagr = (final_equity / initial_cash) ** (1 / years) - 1
+                
+                if max_drawdown_pct < 0:
+                    calmar_ratio = cagr / abs(max_drawdown_pct)
+
+    return {
+        "trades": float(len(trades)),
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "profit_factor": float(profit_factor),
+        "gross_pnl": float(gross.sum()),
+        "net_pnl": float(pnls.sum()),
+        "costs": float(costs.sum()),
+        "sharpe_ratio": float(sharpe_ratio),
+        "max_drawdown": float(max_drawdown),
+        "max_drawdown_pct": float(max_drawdown_pct * 100),
+        "calmar_ratio": float(calmar_ratio),
+        "avg_bars_held": float(bars_held.mean()),
+        "max_bars_held": int(bars_held.max()),
+    }
+
+
+def print_summary(pf: Portfolio):
+    m = compute_metrics(pf.trades, pf.equity_curve, pf.cash + sum(p.qty * p.entry_price for p in pf.positions.values()))
+    
+    print("\n" + "="*70)
+    print("BACKTEST SUMMARY - FIXED VERSION v2.0")
+    print("="*70)
+    
+    print("\n📊 TRADE STATISTICS:")
+    print(f"  Total trades:       {int(m['trades'])}")
+    print(f"  Win rate:           {m['win_rate']*100:.2f}%")
+    print(f"  Avg winner:         ${m['avg_win']:.2f}")
+    print(f"  Avg loser:          ${m['avg_loss']:.2f}")
+    print(f"  Expectancy:         ${m['expectancy']:.2f} per trade")
+    print(f"  Profit factor:      {m['profit_factor']:.3f}" if np.isfinite(m["profit_factor"]) else "  Profit factor:      inf")
+    
+    print("\n💰 P&L:")
+    print(f"  Gross PnL:          ${m['gross_pnl']:.2f}")
+    print(f"  Net PnL:            ${m['net_pnl']:.2f}")
+    print(f"  Total costs:        ${m['costs']:.2f}")
+    print(f"  Cost ratio:         {(m['costs'] / abs(m['gross_pnl']) * 100) if m['gross_pnl'] != 0 else 0:.2f}%")
+    
+    print("\n📈 RISK METRICS:")
+    print(f"  Sharpe Ratio:       {m['sharpe_ratio']:.3f}")
+    print(f"  Max Drawdown:       ${m['max_drawdown']:.2f} ({m['max_drawdown_pct']:.2f}%)")
+    print(f"  Calmar Ratio:       {m['calmar_ratio']:.3f}")
+    
+    print("\n⏱️  HOLDING PERIODS:")
+    print(f"  Avg bars held:      {m['avg_bars_held']:.1f}")
+    print(f"  Max bars held:      {m['max_bars_held']}")
+
+    if pf.trades:
+        df = pd.DataFrame([dataclasses.asdict(t) for t in pf.trades])
+        
+        print("\n🏆 TOP 5 TRADES (by PnL):")
+        print(df.sort_values("pnl", ascending=False).head(5)[["ticker", "entry_ts", "exit_ts", "qty", "pnl", "bars_held", "tag"]].to_string(index=False))
+        
+        print("\n💸 BOTTOM 5 TRADES (by PnL):")
+        print(df.sort_values("pnl", ascending=True).head(5)[["ticker", "entry_ts", "exit_ts", "qty", "pnl", "bars_held", "tag"]].to_string(index=False))
+        
+        print("\n📋 EXIT REASONS:")
+        exit_reasons = df["tag"].str.split("|").str[-1].value_counts()
+        for reason, count in exit_reasons.items():
+            pct = (count / len(df)) * 100
+            print(f"  {reason:25s}: {count:3d} ({pct:5.1f}%)")
+    
+    print("\n" + "="*70)
+
+
+# ----------------------------
+# CSV Loading
+# ----------------------------
+
+def load_csv_mapping(csv_args: List[str]) -> Dict[str, str]:
+    out = {}
+    for item in csv_args:
+        if "=" not in item:
+            raise ValueError(f"Invalid --csv '{item}'. Use TICKER=path.csv")
+        t, p = item.split("=", 1)
+        out[t.strip().upper()] = p.strip()
+    return out
+
+
+def read_csv_file(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    return _to_ohlcv(df)
+
+
+def load_data_from_csvs(csv_map: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+    dfs = {}
+    for t, p in csv_map.items():
+        if not os.path.exists(p):
+            raise FileNotFoundError(p)
+        dfs[t] = read_csv_file(p)
+    return dfs
+
+
+def load_data_from_csv_dir(csv_dir: str, tickers: List[str]) -> Dict[str, pd.DataFrame]:
+    dfs = {}
+    for t in tickers:
+        candidates = [
+            os.path.join(csv_dir, f"{t}.csv"),
+            os.path.join(csv_dir, f"{t.lower()}.csv"),
+            os.path.join(csv_dir, f"{t}_1m.csv"),
+            os.path.join(csv_dir, f"{t.lower()}_1m.csv"),
+        ]
+        path = next((c for c in candidates if os.path.exists(c)), None)
+        if not path:
+            raise FileNotFoundError(f"Could not find CSV for {t} in {csv_dir}. Tried: {candidates}")
+        dfs[t] = read_csv_file(path)
+    return dfs
+
+
+# ----------------------------
+# Live mode
+# ----------------------------
+
+def twelve_data_time_series(symbol: str, interval: str, api_key: str, outputsize: int = 300) -> pd.DataFrame:
+    if requests is None:
+        raise RuntimeError("requests is not installed; cannot run live mode.")
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": api_key,
+        "format": "JSON",
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if "values" not in j:
+        raise RuntimeError(f"Twelve Data error for {symbol}: {j}")
+    rows = j["values"]
+    df = pd.DataFrame(rows).rename(columns={"datetime": "timestamp"})
+    return _to_ohlcv(df)
+
+
+def run_live_paper(tickers: List[str], interval: str, params: dict, api_key: str):
+    """Live paper trading with all fixes enabled"""
+    print("="*70)
+    print("LIVE PAPER TRADING MODE - FIXED VERSION v2.0")
+    print("="*70)
+    print("🐛 Critical fixes enabled:")
+    print(f"  ✅ Skip same-bar exits: {params.get('skip_entry_bar_exits', True)}")
+    print(f"  ✅ Minimum stop distance: {params.get('min_stop_distance_pct', 0)*100:.1f}%")
+    print(f"  ✅ Profit-based trailing: {params.get('trailing_stop_activation_pct', 0)*100:.1f}%")
+    print(f"  ✅ Trading hours filter: {params.get('enable_trading_hours', False)}")
+    print(f"  ✅ Adaptive RSI: {params.get('rsi_use_gradient', False)}")
+    print(f"  ✅ Regime sizing: {params.get('enable_regime_sizing', False)}")
+    print("="*70)
+    
+    pf = Portfolio(params["initial_cash"])
+
+    last_seen_ts: Dict[str, pd.Timestamp] = {}
+    pending: Dict[str, Tuple[Signal, pd.Timestamp]] = {}
+
+    while True:
+        last_prices: Dict[str, float] = {}
+
+        for t in tickers:
+            try:
+                df = twelve_data_time_series(t, interval, api_key, outputsize=400)
+                df = add_indicators(df, params)
+
+                ts = df.index[-1]
+                bar = df.loc[ts]
+                last_prices[t] = float(bar["Close"])
+
+                if t in last_seen_ts and ts <= last_seen_ts[t]:
+                    continue
+
+                last_seen_ts[t] = ts
+
+                pf.update_trailing_stops(last_prices, params)
+
+                # Fill pending entries
+                if params.get("enter_on_next_open", True) and t in pending:
+                    sig, created_ts = pending[t]
+                    if created_ts < ts and pf.can_enter(t, bar_index=0, params=params):
+                        entry_px = float(bar["Open"])
+                        regime = detect_market_regime(df)
+                        fill = pf.open_position(ts, 0, t, entry_px, bar, sig.tag, params, last_prices, regime)
+                        if fill:
+                            print(f"[{fill.ts}] 📈 ENTRY {fill.ticker} qty={fill.qty} px={fill.price:.2f} regime={regime} tag={fill.tag}")
+                    del pending[t]
+
+                # Check exits
+                if t in pf.positions:
+                    pos = pf.positions[t]
+                    
+                    # FIX #1: Skip if still on entry bar
+                    if pos.skip_exit_until_ts and ts <= pos.skip_exit_until_ts:
+                        pass  # Skip exit checks
+                    else:
+                        trig = exit_check_bar_highlow_with_gaps(bar, pos, params)
+                        if trig:
+                            raw_exit_px, reason = trig
+                            fill = pf.close_position(ts, 0, t, raw_exit_px, reason, params)
+                            if fill:
+                                print(f"[{fill.ts}] 📉 EXIT  {fill.ticker} qty={fill.qty} px={fill.price:.2f} reason={reason}")
+
+                # Generate signals
+                sig = generate_signal(df, t, params)
+                if sig and params.get("enter_on_next_open", True):
+                    if pf.can_enter(t, 0, params=params):
+                        pending[t] = (sig, ts)
+                        print(f"[{ts}] 🔔 SIGNAL {t}: {sig.tag} (queued for next bar)")
+                elif sig:
+                    entry_px = float(bar["Close"])
+                    regime = detect_market_regime(df)
+                    fill = pf.open_position(ts, 0, t, entry_px, bar, sig.tag, params, last_prices, regime)
+                    if fill:
+                        print(f"[{fill.ts}] 📈 ENTRY {fill.ticker} qty={fill.qty} px={fill.price:.2f} regime={regime} tag={fill.tag}")
+
+                # Status line
+                vol_ratio = bar["Volume"] / df["Volume"].tail(20).mean() if df["Volume"].tail(20).mean() > 0 else 0
+                trailing_info = ""
+                if t in pf.positions and pf.positions[t].trailing_stop:
+                    trailing_info = f"Trail=${pf.positions[t].trailing_stop:.2f}"
+                
+                regime = detect_market_regime(df)
+                print(
+                    f"[{ts}] {t:6s} "
+                    f"C={float(bar['Close']):7.2f} "
+                    f"RSI={float(bar['RSI']):5.1f} "
+                    f"Z={float(bar['LR_Z']) if not np.isnan(bar['LR_Z']) else 0.0:5.2f} "
+                    f"Vol={vol_ratio:4.2f}x "
+                    f"Reg={regime:8s} "
+                    f"Pos={'✓' if t in pf.positions else '✗'} "
+                    f"{trailing_info}"
+                )
+
+            except Exception as e:
+                print(f"[{t}] ❌ error: {e}")
+
+        eq = pf.equity(last_prices)
+        m = compute_metrics(pf.trades, pf.equity_curve, params["initial_cash"])
+        print(
+            f"\n💼 Portfolio: Cash=${pf.cash:.2f} Equity=${eq:.2f} "
+            f"Open={len(pf.positions)} Trades={len(pf.trades)} "
+            f"PnL=${m['net_pnl']:.2f} Sharpe={m['sharpe_ratio']:.2f}\n"
+        )
+
+        time.sleep(30)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Day Trading — FIXED VERSION v2.0")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("backtest", help="Run backtest from CSV")
+    b.add_argument("--csv", action="append", default=[], help="TICKER=path.csv")
+    b.add_argument("--csv-dir", default=None)
+    b.add_argument("--tickers", nargs="*", default=[])
+    b.add_argument("--out-trades", default=None)
+
+    l = sub.add_parser("live", help="Paper trading via Twelve Data")
+    l.add_argument("--tickers", nargs="+", required=True)
+    l.add_argument("--interval", default="1min")
+
+    for sp in (b, l):
+        sp.add_argument("--initial-cash", type=float, default=DEFAULT_PARAMS["initial_cash"])
+        sp.add_argument("--risk-per-trade", type=float, default=DEFAULT_PARAMS["risk_per_trade"])
+        sp.add_argument("--max-positions", type=int, default=DEFAULT_PARAMS["max_positions"])
+        sp.add_argument("--cooldown-bars", type=int, default=DEFAULT_PARAMS["cooldown_bars"])
+        sp.add_argument("--max-pos-value-frac", type=float, default=DEFAULT_PARAMS["max_pos_value_frac"])
+        sp.add_argument("--commission", type=float, default=DEFAULT_PARAMS["commission_per_share"])
+        sp.add_argument("--slippage-bps", type=float, default=DEFAULT_PARAMS["slippage_bps"])
+        
+        # Exits - FIX #2
+        sp.add_argument("--atr-stop", type=float, default=DEFAULT_PARAMS["atr_stop"])
+        sp.add_argument("--atr-target", type=float, default=DEFAULT_PARAMS["atr_target"])
+        sp.add_argument("--min-stop-pct", type=float, default=DEFAULT_PARAMS["min_stop_distance_pct"])
+        
+        # Indicators
+        sp.add_argument("--rsi-period", type=int, default=DEFAULT_PARAMS["rsi_period"])
+        sp.add_argument("--atr-period", type=int, default=DEFAULT_PARAMS["atr_period"])
+        sp.add_argument("--sma-fast", type=int, default=DEFAULT_PARAMS["sma_fast"])
+        sp.add_argument("--sma-slow", type=int, default=DEFAULT_PARAMS["sma_slow"])
+        
+        # Signals - FIX #5
+        sp.add_argument("--rsi-oversold", type=float, default=DEFAULT_PARAMS["rsi_oversold"])
+        sp.add_argument("--rsi-use-gradient", action="store_true", default=DEFAULT_PARAMS["rsi_use_gradient"])
+        sp.add_argument("--rsi-use-hard-filter", action="store_true", default=False)
+        sp.add_argument("--breakout-lookback", type=int, default=DEFAULT_PARAMS["breakout_lookback"])
+        sp.add_argument("--breakout-buffer", type=float, default=DEFAULT_PARAMS["breakout_buffer"])
+        
+        # Regime
+        sp.add_argument("--enable-regime-gate", action="store_true", default=DEFAULT_PARAMS["enable_regime_gate"])
+        sp.add_argument("--disable-regime-gate", action="store_true", default=False)
+        
+        # Linear regression
+        sp.add_argument("--lr-period", type=int, default=DEFAULT_PARAMS["lr_period"])
+        sp.add_argument("--lr-min-r2", type=float, default=DEFAULT_PARAMS["lr_min_r2"])
+        sp.add_argument("--lr-min-slope", type=float, default=DEFAULT_PARAMS["lr_min_slope"])
+        sp.add_argument("--lr-z-entry", type=float, default=DEFAULT_PARAMS["lr_z_entry"])
+        sp.add_argument("--lr-z-breakout", type=float, default=DEFAULT_PARAMS["lr_z_breakout"])
+        sp.add_argument("--lr-use-log", action="store_true", default=DEFAULT_PARAMS["lr_use_log"])
+        sp.add_argument("--lr-use-linear", action="store_true", default=False)
+        
+        sp.add_argument("--gap-fill-model", action="store_true", default=DEFAULT_PARAMS["gap_fill_model"])
+        sp.add_argument("--no-gap-fill-model", action="store_true", default=False)
+        
+        # Trailing stops - FIX #3
+        sp.add_argument("--enable-trailing-stop", action="store_true", default=DEFAULT_PARAMS["enable_trailing_stop"])
+        sp.add_argument("--disable-trailing-stop", action="store_true", default=False)
+        sp.add_argument("--trailing-activation-pct", type=float, default=DEFAULT_PARAMS["trailing_stop_activation_pct"])
+        sp.add_argument("--trailing-distance-pct", type=float, default=DEFAULT_PARAMS["trailing_stop_distance_pct"])
+        
+        # Volume filter
+        sp.add_argument("--enable-volume-filter", action="store_true", default=DEFAULT_PARAMS["enable_volume_filter"])
+        sp.add_argument("--disable-volume-filter", action="store_true", default=False)
+        sp.add_argument("--min-volume-ratio", type=float, default=DEFAULT_PARAMS["min_volume_ratio"])
+        sp.add_argument("--volume-lookback", type=int, default=DEFAULT_PARAMS["volume_lookback"])
+        
+        # Volatility adjustment
+        sp.add_argument("--enable-vol-adjustment", action="store_true", default=DEFAULT_PARAMS["enable_vol_adjustment"])
+        sp.add_argument("--disable-vol-adjustment", action="store_true", default=False)
+        sp.add_argument("--vol-lookback", type=int, default=DEFAULT_PARAMS["vol_lookback"])
+        
+        # Time exit
+        sp.add_argument("--enable-time-exit", action="store_true", default=DEFAULT_PARAMS["enable_time_exit"])
+        sp.add_argument("--disable-time-exit", action="store_true", default=False)
+        sp.add_argument("--max-hold-bars", type=int, default=DEFAULT_PARAMS["max_hold_bars"])
+        
+        # FIX #1: Same-bar exit skip
+        sp.add_argument("--skip-entry-bar-exits", action="store_true", default=DEFAULT_PARAMS["skip_entry_bar_exits"])
+        sp.add_argument("--allow-entry-bar-exits", action="store_true", default=False)
+        
+        # FIX #4: Trading hours
+        sp.add_argument("--enable-trading-hours", action="store_true", default=False)
+        sp.add_argument("--disable-trading-hours", action="store_true", default=False)
+        sp.add_argument("--avoid-lunch", action="store_true", default=DEFAULT_PARAMS["avoid_lunch"])
+        sp.add_argument("--trade-lunch", action="store_true", default=False)
+        
+        # FIX #6: Regime sizing
+        sp.add_argument("--enable-regime-sizing", action="store_true", default=DEFAULT_PARAMS["enable_regime_sizing"])
+        sp.add_argument("--disable-regime-sizing", action="store_true", default=False)
+        sp.add_argument("--ranging-size-reduction", type=float, default=DEFAULT_PARAMS["ranging_size_reduction"])
+        
+        # Debug
+        sp.add_argument("--debug-signals", action="store_true", default=False)
+
+    return p.parse_args()
+
+
+def build_params(args) -> dict:
+    params = dict(DEFAULT_PARAMS)
+
+    params["initial_cash"] = args.initial_cash
+    params["risk_per_trade"] = args.risk_per_trade
+    params["max_positions"] = args.max_positions
+    params["cooldown_bars"] = args.cooldown_bars
+    params["max_pos_value_frac"] = args.max_pos_value_frac
+    params["commission_per_share"] = args.commission
+    params["slippage_bps"] = args.slippage_bps
+    
+    # FIX #2
+    params["atr_stop"] = args.atr_stop
+    params["atr_target"] = args.atr_target
+    params["min_stop_distance_pct"] = args.min_stop_pct
+
+    params["rsi_period"] = args.rsi_period
+    params["atr_period"] = args.atr_period
+    params["sma_fast"] = args.sma_fast
+    params["sma_slow"] = args.sma_slow
+    
+    # FIX #5
+    params["rsi_oversold"] = args.rsi_oversold
+    if getattr(args, "rsi_use_hard_filter", False):
+        params["rsi_use_gradient"] = False
+    else:
+        params["rsi_use_gradient"] = bool(args.rsi_use_gradient)
+    params["breakout_lookback"] = args.breakout_lookback
+    params["breakout_buffer"] = args.breakout_buffer
+
+    if getattr(args, "disable_regime_gate", False):
+        params["enable_regime_gate"] = False
+    else:
+        params["enable_regime_gate"] = bool(args.enable_regime_gate)
+
+    params["lr_period"] = args.lr_period
+    params["lr_min_r2"] = args.lr_min_r2
+    params["lr_min_slope"] = args.lr_min_slope
+    params["lr_z_entry"] = args.lr_z_entry
+    params["lr_z_breakout"] = args.lr_z_breakout
+    
+    if getattr(args, "lr_use_linear", False):
+        params["lr_use_log"] = False
+    else:
+        params["lr_use_log"] = bool(args.lr_use_log)
+
+    if getattr(args, "no_gap_fill_model", False):
+        params["gap_fill_model"] = False
+    else:
+        params["gap_fill_model"] = bool(args.gap_fill_model)
+    
+    # FIX #3
+    if getattr(args, "disable_trailing_stop", False):
+        params["enable_trailing_stop"] = False
+    else:
+        params["enable_trailing_stop"] = bool(args.enable_trailing_stop)
+    params["trailing_stop_activation_pct"] = args.trailing_activation_pct
+    params["trailing_stop_distance_pct"] = args.trailing_distance_pct
+    
+    if getattr(args, "disable_volume_filter", False):
+        params["enable_volume_filter"] = False
+    else:
+        params["enable_volume_filter"] = bool(args.enable_volume_filter)
+    params["min_volume_ratio"] = args.min_volume_ratio
+    params["volume_lookback"] = args.volume_lookback
+    
+    if getattr(args, "disable_vol_adjustment", False):
+        params["enable_vol_adjustment"] = False
+    else:
+        params["enable_vol_adjustment"] = bool(args.enable_vol_adjustment)
+    params["vol_lookback"] = args.vol_lookback
+    
+    if getattr(args, "disable_time_exit", False):
+        params["enable_time_exit"] = False
+    else:
+        params["enable_time_exit"] = bool(args.enable_time_exit)
+    params["max_hold_bars"] = args.max_hold_bars
+    
+    # FIX #1
+    if getattr(args, "allow_entry_bar_exits", False):
+        params["skip_entry_bar_exits"] = False
+    else:
+        params["skip_entry_bar_exits"] = bool(args.skip_entry_bar_exits)
+    
+    # FIX #4
+    if getattr(args, "disable_trading_hours", False):
+        params["enable_trading_hours"] = False
+    else:
+        params["enable_trading_hours"] = bool(getattr(args, "enable_trading_hours", False))
+    
+    if getattr(args, "trade_lunch", False):
+        params["avoid_lunch"] = False
+    else:
+        params["avoid_lunch"] = bool(args.avoid_lunch)
+    
+    # FIX #6
+    if getattr(args, "disable_regime_sizing", False):
+        params["enable_regime_sizing"] = False
+    else:
+        params["enable_regime_sizing"] = bool(args.enable_regime_sizing)
+    params["ranging_size_reduction"] = args.ranging_size_reduction
+    
+    params["debug_signals"] = getattr(args, "debug_signals", False)
+
+    return params
+
+
+def main():
+    args = parse_args()
+    params = build_params(args)
+
+    if args.cmd == "backtest":
+        if args.csv:
+            csv_map = load_csv_mapping(args.csv)
+            dfs = load_data_from_csvs(csv_map)
+        elif args.csv_dir:
+            if not args.tickers:
+                raise SystemExit("When using --csv-dir you must provide --tickers")
+            dfs = load_data_from_csv_dir(args.csv_dir, [t.upper() for t in args.tickers])
+        else:
+            raise SystemExit("Provide either --csv TICKER=path.csv or --csv-dir + --tickers")
+
+        pf = run_backtest(dfs, params)
+        print_summary(pf)
+
+        if args.out_trades:
+            out = pd.DataFrame([dataclasses.asdict(t) for t in pf.trades])
+            out.to_csv(args.out_trades, index=False)
+            print(f"\n💾 Wrote trades to: {args.out_trades}")
+        return
+
+    if args.cmd == "live":
+        api_key = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+        if not api_key:
+            raise SystemExit("Set TWELVE_DATA_API_KEY environment variable")
+        tickers = [t.upper() for t in args.tickers]
+        run_live_paper(tickers, args.interval, params, api_key)
+        return
+
+
+if __name__ == "__main__":
+    main()
