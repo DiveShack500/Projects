@@ -1,0 +1,911 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import requests
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.metrics import mean_squared_error, r2_score
+from prophet import Prophet
+from binance.client import Client
+import lightgbm as lgb
+import xgboost as xgb
+import shap
+
+# ====================================
+# CONFIGURATION
+# ====================================
+BINANCE_API_KEY    = "KoEfbET2jeqe0julQ90QF76cU7UWpaRuj4lQrIW4fHwdxLPzuEyBzsUN2x3NWDYP"
+BINANCE_API_SECRET = "c666YKQPRrHTGReQcACIVzckCg9as4IGC8nDJzM79qQUkW23YTiTlgXANwOxEQH9"
+
+WINDOW_SIZE      = 120
+FORECAST_HORIZON = 20
+
+TRAIN_FRAC = 0.70
+VAL_FRAC   = 0.10
+# TEST_FRAC  = 0.20 — remaining
+
+
+# ====================================
+# NaN-aware scaling helpers (train-only fit)
+# ====================================
+def nan_standardize_fit(X_train: np.ndarray):
+    mu = np.nanmean(X_train, axis=0)
+    sd = np.nanstd(X_train, axis=0)
+    sd = np.where((~np.isfinite(sd)) | (sd < 1e-12), 1.0, sd)
+    mu = np.where(~np.isfinite(mu), 0.0, mu)
+    return mu, sd
+
+
+def nan_standardize_transform(X: np.ndarray, mu: np.ndarray, sd: np.ndarray):
+    return (X - mu) / sd
+
+
+# ====================================
+# 0. Fear & Greed Index
+# ====================================
+def fetch_fear_greed_index():
+    url = "https://api.alternative.me/fng/?limit=0"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()["data"]
+        records = []
+        for item in data:
+            try:
+                date  = pd.to_datetime(int(item["timestamp"]), unit="s").normalize() + pd.Timedelta(days=1)
+                value = float(item["value"])
+                records.append({"Date": date, "FearGreedIndex": value})
+            except Exception:
+                continue
+        df_fgi = (
+            pd.DataFrame(records)
+            .dropna()
+            .sort_values("Date")
+            .drop_duplicates("Date", keep="last")
+            .reset_index(drop=True)
+        )
+        print(f"✅ Fear & Greed Index: {len(df_fgi)} records")
+        return df_fgi
+    except Exception as e:
+        print(f"⚠️  Fear & Greed Index failed: {e}")
+        return pd.DataFrame(columns=["Date", "FearGreedIndex"])
+
+
+# ====================================
+# 1. On-Chain Metrics
+# ====================================
+def _blockchain_chart(chart_name: str, label: str) -> pd.DataFrame:
+    url = (
+        f"https://api.blockchain.info/charts/{chart_name}"
+        f"?timespan=all&format=json&sampled=false"
+    )
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        values = r.json().get("values", [])
+        records = [
+            {
+                "Date": pd.to_datetime(int(v["x"]), unit="s").normalize() + pd.Timedelta(days=1),
+                label: float(v["y"]),
+            }
+            for v in values
+        ]
+        df = (
+            pd.DataFrame(records)
+            .dropna()
+            .sort_values("Date")
+            .drop_duplicates("Date", keep="last")
+            .reset_index(drop=True)
+        )
+        print(f"   ✅ {label}: {len(df)} records")
+        return df
+    except Exception as e:
+        print(f"   ⚠️  {label} failed: {e}")
+        return pd.DataFrame(columns=["Date", label])
+
+
+def _coinmetrics_metrics(metrics: list) -> pd.DataFrame:
+    metric_str = ",".join(metrics)
+    url = (
+        "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+        f"?assets=btc&metrics={metric_str}&frequency=1d&page_size=10000"
+    )
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
+            raise ValueError("Empty response")
+        df = pd.DataFrame(data)
+        df["Date"] = pd.to_datetime(df["time"]).dt.normalize() + pd.Timedelta(days=1)
+        df = df.drop(columns=["asset", "time"], errors="ignore")
+        for col in metrics:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = (
+            df.dropna(subset=["Date"])
+            .sort_values("Date")
+            .drop_duplicates("Date", keep="last")
+            .reset_index(drop=True)
+        )
+        found = [m for m in metrics if m in df.columns]
+        print(f"   ✅ CoinMetrics — {found}: {len(df)} records")
+        return df
+    except Exception as e:
+        print(f"   ⚠️  CoinMetrics failed: {e}")
+        return pd.DataFrame(columns=["Date"] + metrics)
+
+
+def fetch_onchain_metrics() -> pd.DataFrame:
+    print("\n⛓️  Fetching on-chain metrics …")
+
+    bc_charts = {
+        "hash-rate":                        "HashRate",
+        "n-unique-addresses":               "ActiveAddresses",
+        "n-transactions":                   "TxCount",
+        "estimated-transaction-volume-usd": "TxVolumeUSD",
+        "miners-revenue":                   "MinersRevenue",
+    }
+
+    bc_frames = []
+    for chart, label in bc_charts.items():
+        bc_frames.append(_blockchain_chart(chart, label))
+        time.sleep(0.3)
+
+    cm_df = _coinmetrics_metrics(["CapMVRVCur", "NVTAdj", "TxTfrValAdjUSD"])
+    cm_df = cm_df.rename(columns={
+        "CapMVRVCur":     "MVRV",
+        "NVTAdj":         "NVT",
+        "TxTfrValAdjUSD": "AdjTxVolume",
+    })
+
+    all_frames   = bc_frames + [cm_df]
+    valid_frames = [f for f in all_frames if len(f) > 0]
+
+    if not valid_frames:
+        print("⚠️  No on-chain data retrieved — proceeding without it")
+        return pd.DataFrame(columns=["Date"])
+
+    all_dates = (
+        pd.concat([f[["Date"]] for f in valid_frames])
+        .drop_duplicates()
+        .sort_values("Date")
+    )
+    merged = all_dates.copy()
+
+    for frame in valid_frames:
+        merged = pd.merge_asof(
+            merged.sort_values("Date"),
+            frame.sort_values("Date"),
+            on="Date",
+            direction="backward",
+        )
+
+    for col in [c for c in merged.columns if c != "Date"]:
+        merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+    for col in ["HashRate", "ActiveAddresses", "TxCount", "TxVolumeUSD",
+                "MinersRevenue", "AdjTxVolume"]:
+        if col in merged.columns:
+            merged[f"Log_{col}"] = np.log1p(merged[col].clip(lower=0))
+
+    for col in ["ActiveAddresses", "TxCount", "HashRate"]:
+        if col in merged.columns:
+            merged[f"{col}_7D_Change"] = merged[col].pct_change(7)
+
+    if "MVRV" in merged.columns:
+        merged["MVRV_Overvalued"]  = (merged["MVRV"] > 3.5).astype(float)
+        merged["MVRV_Undervalued"] = (merged["MVRV"] < 1.0).astype(float)
+
+    if "NVT" in merged.columns:
+        merged["NVT_High"] = (merged["NVT"] > 65).astype(float)
+
+    if "MinersRevenue" in merged.columns and "HashRate" in merged.columns:
+        merged["RevenuePerHash"] = merged["MinersRevenue"] / merged["HashRate"].clip(lower=1e-6)
+
+    print(f"✅ On-chain feature DataFrame: {merged.shape}")
+    return merged.sort_values("Date").reset_index(drop=True)
+
+
+def merge_onchain(df: pd.DataFrame, onchain: pd.DataFrame) -> pd.DataFrame:
+    """Leak-safe merge: asof backward, NaNs preserved for tree models."""
+    if onchain.shape[1] <= 1:
+        return df.reset_index(drop=True)
+
+    df_merged = pd.merge_asof(
+        df.sort_values("Date"),
+        onchain.sort_values("Date"),
+        on="Date",
+        direction="backward",
+    )
+
+    onchain_cols = [c for c in onchain.columns if c != "Date"]
+    print(f"✅ On-chain metrics merged — {len(onchain_cols)} new columns (NaNs preserved)")
+    return df_merged.reset_index(drop=True)
+
+
+# ====================================
+# 2. Political & Halving Features
+# ====================================
+def add_halving_features(df):
+    halving_dates = pd.to_datetime([
+        "2012-11-28", "2016-07-09", "2020-05-11",
+        "2024-04-19", "2028-03-15",
+    ])
+
+    def days_since_halving(date):
+        past = halving_dates[halving_dates <= date]
+        return 9999 if len(past) == 0 else (date - past.max()).days
+
+    def days_to_halving(date):
+        future = halving_dates[halving_dates > date]
+        return 9999 if len(future) == 0 else (future.min() - date).days
+
+    df["Days_Since_Halving"] = [days_since_halving(d) for d in df["Date"]]
+    df["Days_To_Halving"]    = [days_to_halving(d)    for d in df["Date"]]
+
+    df["Halving_Cycle_Position"] = df["Days_Since_Halving"] / (
+        df["Days_Since_Halving"] + df["Days_To_Halving"] + 1e-8
+    )
+    df["Pre_Halving_Proximity"]  = np.exp(-df["Days_To_Halving"]    / 60)
+    df["Post_Halving_Proximity"] = np.exp(-df["Days_Since_Halving"] / 60)
+    return df
+
+
+def add_political_features(df):
+    df["Trump_Admin_1"] = ((df["Date"] >= "2017-01-20") & (df["Date"] < "2021-01-20")).astype(int)
+    df["Biden_Admin"]   = ((df["Date"] >= "2021-01-20") & (df["Date"] < "2025-01-20")).astype(int)
+    df["Trump_Admin_2"] = (df["Date"] >= "2025-01-20").astype(int)
+
+    policy_event_dates = np.array(pd.to_datetime([
+        "2017-12-18", "2021-11-15", "2022-03-09", "2022-05-09",
+        "2022-11-11", "2023-06-05", "2023-06-06", "2024-01-10",
+        "2024-04-20", "2024-11-05",
+    ]))
+    dates_np = df["Date"].values
+
+    def days_since_event(date_np):
+        past = policy_event_dates[policy_event_dates <= date_np]
+        return 999 if len(past) == 0 else int((date_np - past.max()) / np.timedelta64(1, "D"))
+
+    df["Days_Since_Policy_Event"] = [days_since_event(d) for d in dates_np]
+    df["Policy_Event_Proximity"]  = np.exp(-df["Days_Since_Policy_Event"] / 30)
+
+    df["Election_Year"] = df["Date"].dt.year.isin([2020, 2024, 2028]).astype(int)
+    df["Midterm_Year"]  = df["Date"].dt.year.isin([2018, 2022, 2026]).astype(int)
+
+    election_dates = pd.to_datetime(["2020-11-03", "2024-11-05", "2028-11-07"])
+
+    def months_to_next_election(date):
+        future = election_dates[election_dates > date]
+        return 999.0 if len(future) == 0 else (future.min() - date).days / 30.0
+
+    df["Months_To_Election"]  = df["Date"].apply(months_to_next_election)
+    df["Pre_Election_Period"] = (df["Months_To_Election"] <= 3).astype(int)
+
+    df = add_halving_features(df)
+    print("✅ Political + halving features added")
+    return df
+
+
+# ====================================
+# 3. Technical Indicators
+# ====================================
+def compute_rsi(series, period=14):
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs       = avg_gain / (avg_loss + 1e-8)
+    return 100 - (100 / (1 + rs))
+
+
+def fetch_btc_data(api_key, api_secret, interval="1d", start_str="1 Jan 2015"):
+    print("📊 Fetching BTC data from Binance US …")
+    Client.API_URL = "https://api.binance.us/api"
+    client = Client(api_key, api_secret)
+    klines = client.get_historical_klines("BTCUSDT", interval, start_str)
+
+    df = pd.DataFrame(klines, columns=[
+        "Open_time", "Open", "High", "Low", "Close", "Volume",
+        "Close_time", "Quote_asset_volume", "Number_of_trades",
+        "Taker_buy_base_vol", "Taker_buy_quote_vol", "Ignore",
+    ])
+    df["Date"] = pd.to_datetime(df["Open_time"], unit="ms").dt.normalize()
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+    df[["Open", "High", "Low", "Close", "Volume"]] = \
+        df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+    print(f"✅ Fetched {len(df)} days of BTC price data")
+
+    print("🔧 Computing technical indicators …")
+    df["Return_1D"]     = df["Close"].pct_change()
+    df["Log_Return_1D"] = np.log(df["Close"] / df["Close"].shift(1))
+
+    df["EMA_5"]  = df["Close"].ewm(span=5,  adjust=False).mean()
+    df["EMA_20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
+    df["RSI_14"] = compute_rsi(df["Close"], 14)
+    df["RSI_28"] = compute_rsi(df["Close"], 28)
+
+    macd_fast         = df["Close"].ewm(span=12, adjust=False).mean()
+    macd_slow         = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"]        = macd_fast - macd_slow
+    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_hist"]   = df["MACD"] - df["MACD_signal"]
+
+    ma20           = df["Close"].rolling(20).mean()
+    std20          = df["Close"].rolling(20).std()
+    df["BB_upper"] = ma20 + 2 * std20
+    df["BB_lower"] = ma20 - 2 * std20
+
+    df["BB_position"]    = (df["Close"] - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"] + 1e-8)
+    df["EMA_ratio"]      = df["EMA_5"] / (df["EMA_20"] + 1e-8)
+    df["Price_vs_EMA20"] = (df["Close"] - df["EMA_20"]) / (df["EMA_20"] + 1e-8)
+    df["Price_vs_EMA50"] = (df["Close"] - df["EMA_50"]) / (df["EMA_50"] + 1e-8)
+
+    _obv_raw      = (np.sign(df["Close"].diff()) * df["Volume"]).fillna(0).cumsum()
+    df["OBV_14D"] = _obv_raw.pct_change(14)
+
+    df["Volume_MA20"]      = df["Volume"].rolling(20).mean()
+    df["Volume_ratio"]     = df["Volume"] / (df["Volume_MA20"] + 1e-8)
+
+    df["Volatility_7D"]    = df["Log_Return_1D"].rolling(7).std()
+    df["Volatility_14D"]   = df["Log_Return_1D"].rolling(14).std()
+    df["Volatility_30D"]   = df["Log_Return_1D"].rolling(30).std()
+    df["Volatility_ratio"] = df["Volatility_7D"] / (df["Volatility_30D"] + 1e-8)
+
+    df["Price_Change_7D"]  = df["Close"].pct_change(7)
+    df["Price_Change_14D"] = df["Close"].pct_change(14)
+    df["Price_Change_30D"] = df["Close"].pct_change(30)
+
+    df["DayOfWeek"]     = df["Date"].dt.dayofweek
+    df["Month"]         = df["Date"].dt.month
+    df["IsWeekend"]     = (df["DayOfWeek"] >= 5).astype(int)
+    df["DayOfYear_sin"] = np.sin(2 * np.pi * df["Date"].dt.dayofyear / 365.0)
+    df["DayOfYear_cos"] = np.cos(2 * np.pi * df["Date"].dt.dayofyear / 365.0)
+
+    print("😨 Fetching Fear & Greed Index …")
+    fgi_df = fetch_fear_greed_index()
+    if len(fgi_df):
+        df = pd.merge_asof(
+            df.sort_values("Date"),
+            fgi_df.sort_values("Date"),
+            on="Date",
+            direction="backward",
+        )
+    else:
+        df["FearGreedIndex"] = 50.0
+    df["FearGreedIndex"] = df["FearGreedIndex"].ffill()
+
+    print("🏛️  Adding political + halving features …")
+    df = add_political_features(df)
+
+    return df.reset_index(drop=True)
+
+
+# ====================================
+# 4. Prophet Components
+# ====================================
+def add_prophet_components(df, train_end_idx):
+    print("🔮 Fitting Prophet on training data only …")
+    df_train      = df.iloc[:train_end_idx].copy()
+    prophet_train = pd.DataFrame({"ds": df_train["Date"], "y": df_train["Close"]}).dropna()
+    if len(prophet_train) < 2:
+        raise ValueError("Not enough training data for Prophet")
+
+    model = Prophet(
+        daily_seasonality=True,
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+    )
+    model.fit(prophet_train)
+
+    forecast = model.predict(pd.DataFrame({"ds": df["Date"]}))
+
+    df_forecast = pd.DataFrame({
+        "Date":                df["Date"].values,
+        "Prophet_trend":       forecast["trend"].values,
+        "Prophet_weekly":      forecast["weekly"].values if "weekly" in forecast else 0.0,
+        "Prophet_yearly":      forecast["yearly"].values if "yearly" in forecast else 0.0,
+        "Prophet_seasonality": (forecast["yhat"] - forecast["trend"]).values,
+    })
+    result = df.merge(df_forecast, on="Date", how="inner")
+    print(f"✅ Prophet fitted on {len(df_train)} rows, extrapolated to {len(result)} rows")
+    return result
+
+
+# ====================================
+# 5. Sequence / Lag Creation
+# ====================================
+def create_sequences(data_X, log_returns, window_size, forecast_horizon):
+    X, y, P_start = [], [], []
+    n = len(data_X) - window_size - forecast_horizon
+    for i in range(n):
+        X.append(data_X[i : i + window_size])
+        y.append(log_returns[i + window_size : i + window_size + forecast_horizon])
+        P_start.append(data_X[i + window_size - 1, 0])
+    return np.array(X), np.array(y), np.array(P_start)
+
+
+def create_lag_features(data_scaled, feature_cols, window_size, forecast_horizon):
+    n          = len(data_scaled) - window_size - forecast_horizon
+    n_features = len(feature_cols)
+    X_flat     = np.zeros((n, window_size * n_features), dtype=np.float32)
+
+    for i in range(n):
+        X_flat[i] = data_scaled[i : i + window_size].flatten()
+
+    col_names = [
+        f"{feat}_lag{lag}"
+        for lag in range(1, window_size + 1)
+        for feat in feature_cols
+    ]
+    return pd.DataFrame(X_flat, columns=col_names)
+
+
+# ====================================
+# 6. Tree Model Training
+# ====================================
+def train_lgbm(X_train, y_train, X_val, y_val, horizon):
+    models = []
+    print(f"\n🌲 Training LightGBM ({horizon} models, one per horizon step) …")
+    for h in range(horizon):
+        model = lgb.LGBMRegressor(
+            n_estimators=3000,
+            learning_rate=0.01,
+            num_leaves=127,
+            max_depth=-1,
+            min_child_samples=10,
+            subsample=0.9,
+            subsample_freq=1,
+            colsample_bytree=0.8,
+            reg_alpha=0.01,
+            reg_lambda=0.05,
+            min_split_gain=0.0,
+            random_state=42,
+            verbose=-1,
+        )
+        model.fit(
+            X_train, y_train[:, h],
+            eval_set=[(X_val, y_val[:, h])],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=100, verbose=False),
+                lgb.log_evaluation(period=-1),
+            ],
+        )
+        models.append(model)
+        if (h + 1) % 5 == 0 or h == horizon - 1:
+            print(f"   Step {h+1:02d}/{horizon} — best iteration: {model.best_iteration_}")
+    print("✅ LightGBM training complete")
+    return models
+
+
+def train_xgboost(X_train, y_train, X_val, y_val, horizon):
+    models = []
+    print(f"\n⚡ Training XGBoost ({horizon} models, one per horizon step) …")
+    for h in range(horizon):
+        model = xgb.XGBRegressor(
+            n_estimators=3000,
+            learning_rate=0.01,
+            max_depth=8,
+            min_child_weight=5,
+            subsample=0.9,
+            colsample_bytree=0.8,
+            colsample_bylevel=0.8,
+            reg_alpha=0.01,
+            reg_lambda=0.05,
+            gamma=0.0,
+            random_state=42,
+            verbosity=0,
+            early_stopping_rounds=100,
+        )
+        model.fit(
+            X_train, y_train[:, h],
+            eval_set=[(X_val, y_val[:, h])],
+            verbose=False,
+        )
+        models.append(model)
+        if (h + 1) % 5 == 0 or h == horizon - 1:
+            print(f"   Step {h+1:02d}/{horizon} — best iteration: {model.best_iteration}")
+    print("✅ XGBoost training complete")
+    return models
+
+
+# ====================================
+# 7. Evaluation
+# ====================================
+def _reconstruct_prices(preds, y_test_log, P_test, inverse_close):
+    """Shared helper: convert log-return predictions → price arrays."""
+    actual_prices, pred_prices = [], []
+    for i in range(len(preds)):
+        P0        = inverse_close(P_test[i])
+        actual    = P0 * np.exp(np.cumsum(y_test_log[i]))
+        predicted = P0 * np.exp(np.cumsum(preds[i]))
+        actual_prices.append(actual)
+        pred_prices.append(predicted)
+    return actual_prices, pred_prices
+
+
+def _print_metrics(actual_prices, pred_prices, P_test, inverse_close, model_name, horizon):
+    """Print RMSE, R², per-step RMSE, and directional accuracy."""
+    actual_flat = np.concatenate(actual_prices)
+    pred_flat   = np.concatenate(pred_prices)
+    rmse = np.sqrt(mean_squared_error(actual_flat, pred_flat))
+    r2   = r2_score(actual_flat, pred_flat)
+
+    print(f"\n📊 {model_name} Test Set Performance")
+    print(f"   RMSE    : ${rmse:,.2f}")
+    print(f"   R² Score: {r2:.4f}")
+
+    print(f"\n   Per-step RMSE ({model_name}):")
+    for h in range(horizon):
+        step_actual = np.array([actual_prices[i][h] for i in range(len(actual_prices))])
+        step_pred   = np.array([pred_prices[i][h]   for i in range(len(pred_prices))])
+        print(f"     Day {h+1:02d}: ${np.sqrt(mean_squared_error(step_actual, step_pred)):,.0f}")
+
+    print(f"\n   Directional Accuracy ({model_name}):")
+    p0_arr = np.array([inverse_close(P_test[i]) for i in range(len(pred_prices))])
+    for h in range(horizon):
+        step_actual = np.array([actual_prices[i][h] for i in range(len(actual_prices))])
+        step_pred   = np.array([pred_prices[i][h]   for i in range(len(pred_prices))])
+        acc = (np.sign(step_actual - p0_arr) == np.sign(step_pred - p0_arr)).mean() * 100
+        print(f"     Day {h+1:02d}: {acc:.1f}%")
+
+    return rmse, r2
+
+
+def evaluate_tree_model(models, X_test, y_test_log, P_test, inverse_close, model_name):
+    horizon = len(models)
+    preds   = np.column_stack([m.predict(X_test) for m in models])
+
+    actual_prices, pred_prices = _reconstruct_prices(preds, y_test_log, P_test, inverse_close)
+    rmse, r2 = _print_metrics(actual_prices, pred_prices, P_test, inverse_close,
+                               model_name, horizon)
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(actual_prices[0], label="Actual",    linewidth=2)
+    plt.plot(pred_prices[0],   label="Predicted", linewidth=2, linestyle="--")
+    plt.title(f"BTC {FORECAST_HORIZON}-Day Forecast — {model_name} (Test Sample)",
+              fontsize=14, fontweight="bold")
+    plt.xlabel("Days Ahead")
+    plt.ylabel("Price (USD)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fname = f"test_prediction_{model_name.lower().replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    print(f"✅ Saved: {fname}")
+
+    return rmse, r2, preds
+
+
+def evaluate_ensemble(lgbm_models, xgb_models, X_test, y_test_log,
+                      P_test, inverse_close):
+    """
+    Simple average ensemble of LightGBM + XGBoost predictions.
+    Blending two correlated but independently trained models almost always
+    reduces variance vs either model alone at zero additional training cost.
+    Uses the same _reconstruct_prices/_print_metrics helpers as individual
+    models so the evaluation methodology is identical and results are
+    directly comparable.
+    """
+    horizon    = len(lgbm_models)
+    preds_lgbm = np.column_stack([m.predict(X_test) for m in lgbm_models])
+    preds_xgb  = np.column_stack([m.predict(X_test) for m in xgb_models])
+    preds_avg  = (preds_lgbm + preds_xgb) / 2.0
+
+    actual_prices, pred_prices = _reconstruct_prices(
+        preds_avg, y_test_log, P_test, inverse_close
+    )
+    rmse, r2 = _print_metrics(
+        actual_prices, pred_prices, P_test, inverse_close,
+        "Ensemble (LGBM+XGB)", horizon
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(actual_prices[0], label="Actual",    linewidth=2)
+    plt.plot(pred_prices[0],   label="Predicted", linewidth=2, linestyle="--")
+    plt.title(f"BTC {FORECAST_HORIZON}-Day Forecast — Ensemble (Test Sample)",
+              fontsize=14, fontweight="bold")
+    plt.xlabel("Days Ahead")
+    plt.ylabel("Price (USD)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("test_prediction_ensemble.png", dpi=150)
+    print("✅ Saved: test_prediction_ensemble.png")
+
+    return rmse, r2, preds_avg
+
+
+# ====================================
+# 8. SHAP Feature Importance
+# ====================================
+def plot_shap_importance(models, X_test_df, model_name, top_n=20):
+    print(f"\n🔍 Computing SHAP values for {model_name} (day-1 step) …")
+    explainer   = shap.TreeExplainer(models[0])
+    shap_values = explainer.shap_values(X_test_df)
+
+    shap_df = pd.DataFrame(np.abs(shap_values), columns=X_test_df.columns)
+    shap_df.columns = [c.rsplit("_lag", 1)[0] for c in shap_df.columns]
+
+    feature_importance = (
+        shap_df.T.groupby(level=0).sum().T
+        .mean()
+        .sort_values(ascending=False)
+    )
+
+    plt.figure(figsize=(10, 7))
+    feature_importance.head(top_n).plot(kind="barh", color="steelblue")
+    plt.gca().invert_yaxis()
+    plt.title(f"Top {top_n} Features by Mean |SHAP| — {model_name} Day-1",
+              fontsize=13, fontweight="bold")
+    plt.xlabel("Mean |SHAP value|")
+    plt.tight_layout()
+    fname = f"shap_{model_name.lower().replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    print(f"✅ Saved: {fname}")
+
+    print(f"\n   Top 10 features ({model_name}):")
+    for feat, val in feature_importance.head(10).items():
+        print(f"     {feat:<30} {val:.6f}")
+
+    return feature_importance
+
+
+# ====================================
+# 9. Future Forecast
+# ====================================
+def forecast_next_n_days_ensemble(lgbm_models, xgb_models, data_scaled, df,
+                                   inverse_close, n=FORECAST_HORIZON,
+                                   window_size=WINDOW_SIZE):
+    """
+    Forward forecast using the ensemble average of both models.
+    Each model predicts its own step from the same fixed input window —
+    no recursive error accumulation.
+    """
+    X_input = data_scaled[-window_size:].flatten().reshape(1, -1)
+
+    preds_lgbm = np.array([m.predict(X_input)[0] for m in lgbm_models])
+    preds_xgb  = np.array([m.predict(X_input)[0] for m in xgb_models])
+    preds_avg  = (preds_lgbm + preds_xgb) / 2.0
+
+    last_price    = inverse_close(data_scaled[-1, 0])
+    future_prices = last_price * np.exp(np.cumsum(preds_avg))
+    future_dates  = pd.date_range(
+        start=df["Date"].iloc[-1] + pd.Timedelta(days=1), periods=n
+    )
+
+    plt.figure(figsize=(14, 7))
+    recent = df.tail(180)
+    plt.plot(recent["Date"], recent["Close"],
+             label="Historical", linewidth=2, color="steelblue")
+    plt.plot(future_dates, future_prices,
+             label=f"Forecast ({n} Days)",
+             linestyle="--", linewidth=2.5, color="crimson", marker="o")
+    plt.title(f"BTC {n}-Day Forecast (Ensemble)", fontsize=16, fontweight="bold")
+    plt.xlabel("Date")
+    plt.ylabel("Price (USD)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("btc_forecast_ensemble.png", dpi=150)
+    print("✅ Saved: btc_forecast_ensemble.png")
+
+    print(f"\n🔮 {n}-Day Forecast (Ensemble)")
+    print(f"   Current : ${last_price:,.2f}")
+    print(f"   Day {n:>2}  : ${future_prices[-1]:,.2f}")
+    print(f"   Change  : {(future_prices[-1] / last_price - 1) * 100:+.2f}%")
+
+    return future_dates, future_prices
+
+
+# ====================================
+# 10. Leaderboard
+# ====================================
+def compare_models(results: dict):
+    print("\n" + "=" * 52)
+    print("🏆 MODEL COMPARISON")
+    print("=" * 52)
+    print(f"  {'Model':<22} {'RMSE':>12} {'R²':>8}")
+    print(f"  {'-'*22} {'-'*12} {'-'*8}")
+    for name, (rmse, r2) in sorted(results.items(), key=lambda x: x[1][1], reverse=True):
+        print(f"  {name:<22} ${rmse:>10,.0f} {r2:>8.4f}")
+    print("=" * 52)
+
+
+# ====================================
+# 11. Main
+# ====================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🚀 BTC PREDICTION — LIGHTGBM + XGBOOST + ENSEMBLE")
+    print("=" * 60)
+
+    np.random.seed(42)
+
+    # ── 1. Price + technical + political features ────────────────────────
+    df = fetch_btc_data(BINANCE_API_KEY, BINANCE_API_SECRET, start_str="1 Jan 2015")
+
+    # ── 2. On-chain metrics ──────────────────────────────────────────────
+    onchain = fetch_onchain_metrics()
+    df      = merge_onchain(df, onchain)
+
+    df = df.sort_values("Date").reset_index(drop=True)
+    print(f"\n📈 Dataset: {df.shape}")
+    print(f"   Range: {df['Date'].min().date()} → {df['Date'].max().date()}")
+
+    # ── 3. Temporal 3-way split ──────────────────────────────────────────
+    n_rows    = len(df)
+    train_end = int(TRAIN_FRAC * n_rows)
+    val_end   = int((TRAIN_FRAC + VAL_FRAC) * n_rows)
+
+    print(f"\n✂️  3-way temporal split")
+    print(f"   Train : {df['Date'].iloc[0].date()} → "
+          f"{df['Date'].iloc[train_end-1].date()} ({train_end} rows)")
+    print(f"   Val   : {df['Date'].iloc[train_end].date()} → "
+          f"{df['Date'].iloc[val_end-1].date()} ({val_end - train_end} rows)")
+    print(f"   Test  : {df['Date'].iloc[val_end].date()} → "
+          f"{df['Date'].iloc[-1].date()} ({n_rows - val_end} rows)")
+
+    # ── 4. Prophet (fit on training rows only) ───────────────────────────
+    df = add_prophet_components(df, train_end_idx=train_end)
+
+    # ── 5. Feature list ──────────────────────────────────────────────────
+    possible_onchain_cols = [
+        "HashRate", "ActiveAddresses", "TxCount", "TxVolumeUSD", "MinersRevenue",
+        "Log_HashRate", "Log_ActiveAddresses", "Log_TxCount",
+        "Log_TxVolumeUSD", "Log_MinersRevenue",
+        "ActiveAddresses_7D_Change", "TxCount_7D_Change", "HashRate_7D_Change",
+        "MVRV", "NVT", "AdjTxVolume",
+        "MVRV_Overvalued", "MVRV_Undervalued", "NVT_High",
+        "RevenuePerHash",
+    ]
+    onchain_feature_cols = [c for c in possible_onchain_cols if c in df.columns]
+
+    base_feature_cols = [
+        "Close",
+        "Return_1D", "Log_Return_1D",
+        "EMA_5", "EMA_20", "EMA_50",
+        "EMA_ratio", "Price_vs_EMA20", "Price_vs_EMA50",
+        "RSI_14", "RSI_28",
+        "MACD", "MACD_signal", "MACD_hist",
+        "BB_upper", "BB_lower", "BB_position",
+        "OBV_14D",
+        "Volume_ratio", "Volatility_ratio",
+        "Volatility_7D", "Volatility_14D", "Volatility_30D",
+        "Price_Change_7D", "Price_Change_14D", "Price_Change_30D",
+        "Prophet_trend", "Prophet_seasonality", "Prophet_weekly", "Prophet_yearly",
+        "DayOfWeek", "Month", "IsWeekend",
+        "DayOfYear_sin", "DayOfYear_cos",
+        "FearGreedIndex",
+        "Trump_Admin_1", "Biden_Admin", "Trump_Admin_2",
+        "Days_Since_Policy_Event", "Policy_Event_Proximity",
+        "Election_Year", "Midterm_Year",
+        "Pre_Election_Period", "Months_To_Election",
+        "Days_Since_Halving", "Days_To_Halving",
+        "Halving_Cycle_Position",
+        "Pre_Halving_Proximity", "Post_Halving_Proximity",
+    ]
+    feature_cols = base_feature_cols + onchain_feature_cols
+    print(f"\n🔧 Total features: {len(feature_cols)} "
+          f"(base={len(base_feature_cols)}, on-chain={len(onchain_feature_cols)})")
+
+    # ── 6. NaN-aware scaling — fit on train only ─────────────────────────
+    data = df[feature_cols].values.astype(np.float64)
+    data[~np.isfinite(data)] = np.nan
+
+    print("\n📏 Fitting NaN-aware scalers on training data only …")
+    mu_X, sd_X  = nan_standardize_fit(data[:train_end])
+    data_scaled = nan_standardize_transform(data, mu_X, sd_X)
+
+    close_train = data[:train_end, 0]
+    mu_y = np.nanmean(close_train)
+    sd_y = np.nanstd(close_train)
+    if (not np.isfinite(sd_y)) or (sd_y < 1e-12):
+        sd_y = 1.0
+    data_scaled[:, 0] = (data[:, 0] - mu_y) / sd_y
+
+    def inverse_close(z):
+        return z * sd_y + mu_y
+
+    # ── 7. Log-returns (target) ──────────────────────────────────────────
+    close_raw = data[:, 0]
+    if np.isnan(close_raw).any():
+        raise ValueError("Close contains NaNs after feature assembly.")
+    full_log_returns = np.concatenate([[0.0], np.log(close_raw[1:] / close_raw[:-1])])
+
+    # ── 8. Sequence targets ──────────────────────────────────────────────
+    print("\n🔄 Creating sequences …")
+    _, y_log, P_start = create_sequences(
+        data_scaled, full_log_returns, WINDOW_SIZE, FORECAST_HORIZON
+    )
+
+    # ── 9. Sequence splits ───────────────────────────────────────────────
+    seq_train_end = train_end - WINDOW_SIZE - FORECAST_HORIZON + 1
+    seq_val_end   = val_end   - WINDOW_SIZE - FORECAST_HORIZON + 1
+
+    y_train  = y_log[:seq_train_end]
+    y_val    = y_log[seq_train_end:seq_val_end]
+    y_test   = y_log[seq_val_end:]
+    P_test   = P_start[seq_val_end:]
+
+    print(f"   Sequences — train: {len(y_train)}  val: {len(y_val)}  test: {len(y_test)}")
+    if len(y_train) == 0 or len(y_val) == 0 or len(y_test) == 0:
+        raise ValueError(
+            "One or more splits produced zero sequences. "
+            "Increase dataset size or reduce WINDOW_SIZE / FORECAST_HORIZON."
+        )
+
+    # ── 10. Lag feature matrices ─────────────────────────────────────────
+    print("\n🌲 Building lag feature matrices for tree models …")
+    df_lag = create_lag_features(data_scaled, feature_cols, WINDOW_SIZE, FORECAST_HORIZON)
+
+    X_lag_train   = df_lag.iloc[:seq_train_end].values
+    X_lag_val     = df_lag.iloc[seq_train_end:seq_val_end].values
+    X_lag_test    = df_lag.iloc[seq_val_end : seq_val_end + len(y_test)].values
+    X_lag_test_df = pd.DataFrame(X_lag_test, columns=df_lag.columns)
+
+    print(f"   Lag matrix — train: {X_lag_train.shape}  "
+          f"val: {X_lag_val.shape}  test: {X_lag_test.shape}")
+
+    # ── 11. LightGBM ─────────────────────────────────────────────────────
+    lgbm_models = train_lgbm(X_lag_train, y_train, X_lag_val, y_val, FORECAST_HORIZON)
+    lgbm_rmse, lgbm_r2, _ = evaluate_tree_model(
+        lgbm_models, X_lag_test, y_test, P_test, inverse_close, "LightGBM"
+    )
+    plot_shap_importance(lgbm_models, X_lag_test_df, "LightGBM")
+
+    # ── 12. XGBoost ──────────────────────────────────────────────────────
+    xgb_models = train_xgboost(X_lag_train, y_train, X_lag_val, y_val, FORECAST_HORIZON)
+    xgb_rmse, xgb_r2, _ = evaluate_tree_model(
+        xgb_models, X_lag_test, y_test, P_test, inverse_close, "XGBoost"
+    )
+
+    # ── 13. Ensemble ─────────────────────────────────────────────────────
+    ens_rmse, ens_r2, _ = evaluate_ensemble(
+        lgbm_models, xgb_models, X_lag_test, y_test, P_test, inverse_close
+    )
+
+    # ── 14. Leaderboard ──────────────────────────────────────────────────
+    compare_models({
+        "LightGBM":        (lgbm_rmse, lgbm_r2),
+        "XGBoost":         (xgb_rmse,  xgb_r2),
+        "Ensemble":        (ens_rmse,  ens_r2),
+    })
+
+    # ── 15. Forward forecast (ensemble) ──────────────────────────────────
+    print("\n🔮 Forecasting next 20 days …")
+    forecast_next_n_days_ensemble(
+        lgbm_models, xgb_models, data_scaled, df, inverse_close,
+        n=FORECAST_HORIZON, window_size=WINDOW_SIZE,
+    )
+
+    print("\n" + "=" * 60)
+    print("✅ COMPLETE")
+    print("=" * 60)
+    print("""
+OUTPUT FILES
+────────────
+  test_prediction_lightgbm.png  — LightGBM sample forecast plot
+  test_prediction_xgboost.png   — XGBoost sample forecast plot
+  test_prediction_ensemble.png  — Ensemble sample forecast plot
+  shap_lightgbm.png             — Top feature importances (day-1 model)
+  btc_forecast_ensemble.png     — 20-day forward forecast (ensemble)
+
+LEAKAGE AUDIT
+─────────────
+  ✓ 3-way temporal split (train=70% / val=10% / test=20%)
+  ✓ NaN-aware scaling fit on train only
+  ✓ Prophet fit on train only
+  ✓ Tree early stopping uses val set — test never seen during training
+  ✓ On-chain metrics: +1 day publication lag + merge direction='backward'
+  ✓ Fear & Greed: +1 day lag + merge direction='backward'
+  ✓ All technical indicators: strictly backward-looking
+  ✓ Lag features: each row is a backward window only
+  ✓ Direct multi-step: no recursive error accumulation
+  ✓ Ensemble averages post-hoc predictions — no additional data exposure
+""")
